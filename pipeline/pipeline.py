@@ -1,80 +1,66 @@
+#!/usr/bin/env python3
+"""
+Shopping Sessions: DuckDB starter (skeleton).
+
+This runs end to end inside the scorer's container and writes both output tables
+with the exact schema, but the tables are EMPTY, so the checker will mark it
+incorrect. It gives you the plumbing; the rules are yours to implement.
+
+Reads  $DATA_DIR    (default /data)
+Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
+Temp   $SCRATCH_DIR (default /scratch)
+"""
 import json
 import os
-import subprocess
-import sys
-from pathlib import Path
+
 import duckdb
 
-# the main idea here is to be able to take special parameters for testing
-# this now supports CLI arguments (for local testing) and environment variables (for Docker):
-def copy_csv_to_parquet(con: duckdb.DuckDBPyConnection, source: Path, destination: Path, columns: str, select_list: str) -> None:
-    con.execute(f"""
-        COPY (
-            SELECT {select_list}
-            FROM read_csv(
-                '{source.as_posix()}',
-                header=true,
-                delim=',',
-                quote='"',
-                columns={{{columns}}}
-            )
-        ) TO '{destination.as_posix()}' (FORMAT PARQUET);
-    """)
+DATA = os.environ.get("DATA_DIR", "/data")
+OUT = os.environ.get("OUTPUT_DIR", "/output")
+SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
+NCPU = int(os.environ.get("NCPU", os.cpu_count() or 1))
+MEM_GB = int(os.environ.get("MEM_GB", "8"))
 
+con = duckdb.connect()  # in-memory database
+con.execute(f"SET threads = {NCPU}")
+con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.8))}GB'")  # leave headroom for Python
+con.execute(f"SET temp_directory = '{os.path.join(SCRATCH, 'duckdb_tmp')}'")
+con.execute("SET preserve_insertion_order = false")
 
-def main() -> None:
-    if len(sys.argv) >= 3:
-        data_dir = Path(sys.argv[1])
-        output_dir = Path(sys.argv[2])
-    else:
-        data_dir = Path(os.environ.get("DATA_DIR", "/data"))
-        output_dir = Path(os.environ.get("OUTPUT_DIR", "/output"))
+with open(os.path.join(DATA, "manifest.json")) as f:
+    manifest = json.load(f)
+print("window:", manifest["window_start"], "to", manifest["window_end"])
 
-    scratch_dir = Path(os.environ.get("SCRATCH_DIR", "/tmp/scratch"))
-    scratch_dir.mkdir(parents=True, exist_ok=True)
+events_glob = os.path.join(DATA, "events", "*.csv")
+clicks_glob = os.path.join(DATA, "clicks", "*.csv")
 
-    # Read manifest.json in Python so C++ doesn't need a JSON parser
-    manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
-    window_start = manifest["window_start"]
-    window_end = manifest["window_end"]
+# TODO: implement the rules.
+#   Events: parse -> dedup on event_id (smallest ingest_ts, before validation)
+#           -> validate -> drop late -> sessionize per user (gap > 30 min)
+#           -> day of session start -> categories
+#   Clicks: parse -> dedup -> validate -> credit each session to the latest
+#           click at or before its start, within 7 days (ties: smallest click_id)
+#
+# Careful with DuckDB's CSV reader: it repairs or rejects malformed lines in its
+# own way, and it reads a quoted empty field "" as '' rather than null. Check its
+# behaviour against the fixtures before trusting it with the dialect rules.
 
-    # Locate and run the compiled C++ binary
-    repo_root = Path(__file__).resolve().parent.parent
-    cpp_bin = repo_root / "cpp" / "pipeline"
-    user_csv = scratch_dir / "user_daily.csv"
-    campaign_csv = scratch_dir / "campaign_daily.csv"
-
-    cmd = [
-        str(cpp_bin),
-        str(data_dir),
-        window_start,
-        window_end,
-        str(user_csv),
-        str(campaign_csv),
-    ]
-    subprocess.run(cmd, check=True)
-
-    # Prepare clean output directories
-    user_out = output_dir / "user_daily"
-    campaign_out = output_dir / "campaign_daily"
-    user_out.mkdir(parents=True, exist_ok=True)
-    campaign_out.mkdir(parents=True, exist_ok=True)
-
-    con = duckdb.connect()
-    try:
-        copy_csv_to_parquet(
-            con, user_csv, user_out / "part-0.parquet",
-            "'user_id': 'VARCHAR', 'day': 'DATE', 'sessions': 'BIGINT', 'events': 'BIGINT', 'revenue_cents': 'BIGINT', 'top_category': 'VARCHAR'",
-            """user_id, day, sessions, events, revenue_cents, CASE WHEN top_category = '' THEN NULL ELSE top_category END AS top_category""",
-        )
-        copy_csv_to_parquet(
-            con, campaign_csv, campaign_out / "part-0.parquet",
-            "'campaign_id': 'VARCHAR', 'channel': 'VARCHAR', 'day': 'DATE', 'sessions': 'BIGINT', 'purchasing_sessions': 'BIGINT', 'revenue_cents': 'BIGINT', 'assisted_sessions': 'BIGINT'",
-            """campaign_id, channel, day, sessions, purchasing_sessions, revenue_cents, assisted_sessions AS assisted_sessions""",
-        )
-    finally:
-        con.close()
-
-
-if __name__ == "__main__":
-    main()
+# Write both tables with the exact schema the checker expects.
+os.makedirs(os.path.join(OUT, "user_daily"), exist_ok=True)
+os.makedirs(os.path.join(OUT, "campaign_daily"), exist_ok=True)
+con.execute(f"""
+    COPY (
+        SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions,
+               NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category
+        WHERE false
+    ) TO '{os.path.join(OUT, "user_daily", "part-0.parquet")}' (FORMAT parquet)
+""")
+con.execute(f"""
+    COPY (
+        SELECT NULL::VARCHAR AS campaign_id, NULL::VARCHAR AS channel, NULL::DATE AS day,
+               NULL::BIGINT AS sessions, NULL::BIGINT AS purchasing_sessions, NULL::BIGINT AS revenue_cents,
+               NULL::BIGINT AS assisted_sessions
+        WHERE false
+    ) TO '{os.path.join(OUT, "campaign_daily", "part-0.parquet")}' (FORMAT parquet)
+""")
+print("wrote empty user_daily and campaign_daily (skeleton)")
