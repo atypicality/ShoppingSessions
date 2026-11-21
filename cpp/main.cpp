@@ -484,6 +484,74 @@ struct PersonClickMsg {
     ValidClick ck;
 };
 
+// Hybrid sorting: comparison sort for small per-user collections, stable radix
+// sort for larger collections. The passes with constant timestamp bytes are
+// skipped, so nearby timestamps generally require only 3-5 radix passes.
+// Timestamps are signed int64; flipping the sign bit makes their unsigned
+// representation order-preserving.
+#ifndef SHOPPING_RADIX_THRESHOLD
+#define SHOPPING_RADIX_THRESHOLD 1024
+#endif
+#ifndef SHOPPING_RADIX_EVENTS
+#define SHOPPING_RADIX_EVENTS 1
+#endif
+#ifndef SHOPPING_RADIX_CLICKS
+#define SHOPPING_RADIX_CLICKS 1
+#endif
+static_assert(SHOPPING_RADIX_THRESHOLD >= 2, "radix threshold must be at least 2");
+
+template <typename T>
+inline void radix_sort_timestamp(T* data, size_t n, std::vector<T>& scratch) {
+    if (n < 2) return;
+    constexpr uint64_t SIGN_BIT = 1ULL << 63;
+    const uint64_t first_key = static_cast<uint64_t>(data[0].ts) ^ SIGN_BIT;
+    uint64_t differing_bits = 0;
+    for (size_t i = 1; i < n; ++i)
+        differing_bits |= (static_cast<uint64_t>(data[i].ts) ^ SIGN_BIT) ^ first_key;
+    if (!differing_bits) return; // already sorted: all timestamps equal
+
+    scratch.resize(n);
+    T* src = data;
+    T* dst = scratch.data();
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        if (((differing_bits >> shift) & 0xFFu) == 0) continue;
+        size_t offsets[256] = {};
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t k = static_cast<uint64_t>(src[i].ts) ^ SIGN_BIT;
+            ++offsets[(k >> shift) & 0xFFu];
+        }
+        size_t total = 0;
+        for (size_t b = 0; b < 256; ++b) {
+            const size_t count = offsets[b];
+            offsets[b] = total;
+            total += count;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t k = static_cast<uint64_t>(src[i].ts) ^ SIGN_BIT;
+            dst[offsets[(k >> shift) & 0xFFu]++] = src[i];
+        }
+        std::swap(src, dst);
+    }
+    if (src != data) std::copy(src, src + n, data);
+}
+
+// After timestamp-only sorting of clicks, the attribution code expects the
+// FIRST click of the final tied timestamp group to have the lexicographically
+// smallest click ID. Selecting that record once per tie group preserves this
+// rule without repeatedly comparing strings during sort or attribution.
+inline void promote_smallest_click_id_in_ties(ValidClick* clicks, size_t n) {
+    for (size_t begin = 0; begin < n;) {
+        size_t end = begin + 1;
+        size_t min_id = begin;
+        while (end < n && clicks[end].ts == clicks[begin].ts) {
+            if (clicks[end].click_id < clicks[min_id].click_id) min_id = end;
+            ++end;
+        }
+        if (min_id != begin) std::swap(clicks[begin], clicks[min_id]);
+        begin = end;
+    }
+}
+
 // Use a more compact open-addressing table than 50% default occupancy.
 // Change SHOPPING_DEDUP_LOAD and A/B benchmark if different input distributions favor it.
 #ifndef SHOPPING_DEDUP_LOAD
@@ -1111,6 +1179,9 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> ck_offsets;
         std::vector<uint32_t> ck_pos;
         std::vector<ValidClick> flat_clicks;
+        // Scratch is retained per aggregation worker, not reallocated per user.
+        std::vector<ValidEvent> event_radix_scratch;
+        std::vector<ValidClick> click_radix_scratch;
 
         while (true) {
             size_t ps = next_ps.fetch_add(1, std::memory_order_relaxed);
@@ -1140,16 +1211,33 @@ int main(int argc, char** argv) {
                 ValidEvent* evs = sh.flat_events.data() + ev_b;
                 const size_t n_evs = ev_e - ev_b;
                 if (n_evs > 1) {
-                    std::sort(evs, evs + n_evs, [](const ValidEvent& a, const ValidEvent& b) { return a.ts < b.ts; });
+#if SHOPPING_RADIX_EVENTS
+                    if (n_evs >= SHOPPING_RADIX_THRESHOLD)
+                        radix_sort_timestamp(evs, n_evs, event_radix_scratch);
+                    else
+#endif
+                        std::sort(evs, evs + n_evs, [](const ValidEvent& a, const ValidEvent& b) {
+                            return a.ts < b.ts;
+                        });
                 }
 
                 uint32_t ck_b = ck_offsets[pid], ck_e = ck_offsets[pid + 1];
                 ValidClick* clicks = flat_clicks.data() + ck_b;
                 const size_t n_cks = ck_e - ck_b;
                 if (n_cks > 1) {
-                    std::sort(clicks, clicks + n_cks, [](const ValidClick& a, const ValidClick& b) {
-                        return a.ts != b.ts ? a.ts < b.ts : a.click_id < b.click_id;
-                    });
+#if SHOPPING_RADIX_CLICKS
+                    if (n_cks >= SHOPPING_RADIX_THRESHOLD) {
+                        radix_sort_timestamp(clicks, n_cks, click_radix_scratch);
+                        // Attribution assumes the first record in each timestamp
+                        // tie has the smallest ID, just like the old comparator.
+                        promote_smallest_click_id_in_ties(clicks, n_cks);
+                    } else
+#endif
+                    {
+                        std::sort(clicks, clicks + n_cks, [](const ValidClick& a, const ValidClick& b) {
+                            return a.ts != b.ts ? a.ts < b.ts : a.click_id < b.click_id;
+                        });
+                    }
                 }
 
                 for (uint32_t c : active_list) active_cnt[c] = 0;
