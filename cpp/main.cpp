@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -24,7 +25,7 @@ namespace fs = std::filesystem;
 constexpr int64_t MS_PER_SEC = 1000LL, MS_PER_MIN = 60LL * MS_PER_SEC,
                   MS_PER_HOUR = 60LL * MS_PER_MIN, MS_PER_DAY = 24LL * MS_PER_HOUR,
                   SESSION_GAP_MS = 30LL * MS_PER_MIN, SEVEN_DAYS_MS = 7LL * MS_PER_DAY;
-constexpr size_t N_SHARDS = 64;
+constexpr size_t N_SHARDS = 256;
 constexpr size_t SHARD_MASK = N_SHARDS - 1;
 constexpr size_t CHUNK_BYTES = 4 << 20;
 
@@ -55,7 +56,6 @@ inline Hash128 hash128(std::string_view s) noexcept {
     for (size_t i = 0; i < n; ++i) tail |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (i * 8);
     h1 = mix64(h1 ^ tail ^ s.size());
     h2 = mix64(h2 ^ tail ^ (s.size() * 0x517cc1b727220a95ULL));
-    if (h1 == 0 && h2 == 0) h1 = 1;
     return {h1, h2};
 }
 
@@ -87,12 +87,14 @@ struct FlatStrMap {
     size_t count = 0;
     size_t mask = 0;
 
-    void init(size_t expected = 64) {
+    void init(size_t expected = 64, size_t expected_bytes = 0) {
         size_t cap = 64;
         while (cap < expected * 2) cap <<= 1;
         slots.assign(cap, Slot{0, 0, UINT32_MAX, 0});
         mask = cap - 1;
         count = 0;
+        if (expected_bytes > 0) arena.reserve(expected_bytes);
+        if (expected > 0) id_slices.reserve(expected);
     }
 
     void rehash(size_t new_cap) {
@@ -116,7 +118,7 @@ struct FlatStrMap {
         while (true) {
             const auto& s = slots[idx];
             if (s.len == UINT32_MAX) return UINT32_MAX;
-            if (s.hash == h && s.len == sz && std::memcmp(base + s.off, sv.data(), sz) == 0) return s.val;
+            if (s.hash == h && s.len == sz && (sz == 0 || std::memcmp(base + s.off, sv.data(), sz) == 0)) return s.val;
             idx = (idx + 1) & mask;
         }
     }
@@ -138,7 +140,7 @@ struct FlatStrMap {
                 ++count;
                 return val;
             }
-            if (s.hash == h && s.len == sz && std::memcmp(base + s.off, sv.data(), sz) == 0) return s.val;
+            if (s.hash == h && s.len == sz && (sz == 0 || std::memcmp(base + s.off, sv.data(), sz) == 0)) return s.val;
             idx = (idx + 1) & mask;
         }
     }
@@ -160,7 +162,7 @@ struct FlatStrMap {
                 ++count;
                 return id;
             }
-            if (s.hash == h && s.len == sz && std::memcmp(base + s.off, sv.data(), sz) == 0) return s.val;
+            if (s.hash == h && s.len == sz && (sz == 0 || std::memcmp(base + s.off, sv.data(), sz) == 0)) return s.val;
             idx = (idx + 1) & mask;
         }
     }
@@ -225,34 +227,51 @@ std::vector<ByteChunk> make_chunks(const std::vector<MMapFile>& files) {
     return chunks;
 }
 
-inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) noexcept {
-    const size_t len = line.size();
-    if (len == 0) return false;
-    const char* p = line.data();
-    const bool has_q = (std::memchr(p, '"', len) != nullptr);
-    size_t idx = 0, start = 0;
-    if (!has_q) {
-        while (true) {
-            const char* comma = static_cast<const char*>(std::memchr(p + start, ',', len - start));
-            if (idx >= n) return false;
-            if (!comma) {
-                out[idx++] = std::string_view(p + start, len - start);
-                return idx == n;
-            }
-            out[idx++] = std::string_view(p + start, static_cast<size_t>(comma - (p + start)));
-            start = static_cast<size_t>(comma - p) + 1;
-        }
-    }
+inline bool next_csv_line(const char*& cur, const char* end, size_t n, std::string_view* out) noexcept {
+    const char* p = cur;
+    if (p >= end) return false;
+    if (*p == '\n') { cur = p + 1; return false; }
+
+    size_t idx = 0;
+    bool ok = true;
     while (true) {
-        const char* comma = static_cast<const char*>(std::memchr(p + start, ',', len - start));
-        size_t flen = comma ? static_cast<size_t>(comma - (p + start)) : (len - start);
-        std::string_view f(p + start, flen);
-        if (flen >= 2 && f.front() == '"' && f.back() == '"') f = f.substr(1, flen - 2);
-        if (std::memchr(f.data(), '"', f.size()) != nullptr) return false;
-        if (idx >= n) return false;
-        out[idx++] = f;
-        if (!comma) return idx == n;
-        start = static_cast<size_t>(comma - p) + 1;
+        const char* fstart = p;
+        if (p < end && __builtin_expect(*p == '"', 0)) {
+            ++p;
+            while (p < end && *p != ',' && *p != '\n' && *p != '"') ++p;
+            if (p < end && *p == '"') {
+                const char* qend = p;
+                ++p;
+                if (p < end && *p != ',' && *p != '\n') {
+                    while (p < end && *p != '\n') ++p;
+                    cur = (p < end) ? p + 1 : end;
+                    return false;
+                }
+                if (idx < n) out[idx++] = std::string_view(fstart + 1, static_cast<size_t>(qend - (fstart + 1)));
+                else ok = false;
+            } else {
+                while (p < end && *p != '\n') ++p;
+                cur = (p < end) ? p + 1 : end;
+                return false;
+            }
+        } else {
+            while (p < end && *p != ',' && *p != '\n') {
+                if (__builtin_expect(*p == '"', 0)) {
+                    while (p < end && *p != '\n') ++p;
+                    cur = (p < end) ? p + 1 : end;
+                    return false;
+                }
+                ++p;
+            }
+            if (idx < n) out[idx++] = std::string_view(fstart, static_cast<size_t>(p - fstart));
+            else ok = false;
+        }
+
+        if (p >= end || *p == '\n') {
+            cur = (p < end) ? p + 1 : end;
+            return ok && idx == n;
+        }
+        ++p;
     }
 }
 
@@ -359,6 +378,7 @@ struct UnionFind {
     FlatStrMap map;
     std::vector<uint32_t> parent;
     std::vector<uint32_t> min_idx;
+    std::vector<uint64_t> root_hash;
 
     uint32_t get_or_add(std::string_view sv) {
         uint32_t old_n = static_cast<uint32_t>(map.id_slices.size());
@@ -382,11 +402,24 @@ struct UnionFind {
         if (map.view(min_idx[rb]) < map.view(min_idx[ra])) min_idx[ra] = min_idx[rb];
     }
     void freeze() {
+        root_hash.resize(parent.size());
         for (uint32_t i = 0; i < parent.size(); ++i) parent[i] = find(i);
+        for (uint32_t i = 0; i < parent.size(); ++i) {
+            if (parent[i] == i) root_hash[i] = hash64(map.view(min_idx[i]));
+        }
     }
     inline std::string_view canonical(std::string_view sv) const noexcept {
+        if (map.count == 0) return sv;
         uint32_t idx = map.find(sv);
         return (idx == UINT32_MAX) ? sv : map.view(min_idx[parent[idx]]);
+    }
+    inline std::pair<std::string_view, uint64_t> canonical_with_hash(std::string_view sv) const noexcept {
+        uint64_t h = hash64(sv);
+        if (map.count == 0) return {sv, h};
+        uint32_t idx = map.find(sv, h);
+        if (idx == UINT32_MAX) return {sv, h};
+        uint32_t r = parent[idx];
+        return {map.view(min_idx[r]), root_hash[r]};
     }
 };
 
@@ -394,10 +427,11 @@ struct RawDedupEvent {
     Hash128 eid_hash;
     int64_t ingest_ts;
     int64_t ts;
-    std::string_view person;
+    const char* person_ptr;
+    uint32_t person_len;
     uint32_t category_id;
-    int32_t price_cents;
-    uint8_t flags;
+    uint32_t price_flags;
+    uint32_t gen;
 };
 
 struct ValidEvent {
@@ -435,22 +469,40 @@ struct PersonClickMsg {
 
 struct FlatEventMap {
     std::vector<RawDedupEvent> slots;
+    std::vector<uint32_t> used;
     size_t mask = 0;
+    uint32_t gen = 0;
 
-    void init(size_t expected) {
+    void reset(size_t expected) {
         size_t cap = 1024;
         while (cap < expected * 2) cap <<= 1;
-        slots.assign(cap, RawDedupEvent{{0, 0}, 0, 0, {}, 0, 0, 0});
-        mask = cap - 1;
+        if (slots.size() < cap) {
+            slots.assign(cap, RawDedupEvent{{0, 0}, 0, 0, nullptr, 0, 0, 0, 0});
+            gen = 1;
+        } else if (++gen == 0) {
+            for (auto& s : slots) s.gen = 0;
+            gen = 1;
+        }
+        mask = slots.size() - 1;
+        used.clear();
+        if (used.capacity() < expected) used.reserve(expected);
     }
 
     inline void insert_or_min(const RawDedupEvent& e) noexcept {
         size_t idx = e.eid_hash.lo & mask;
         while (true) {
             auto& s = slots[idx];
-            if (s.eid_hash.lo == 0 && s.eid_hash.hi == 0) { s = e; return; }
+            if (s.gen != gen) {
+                s = e;
+                s.gen = gen;
+                used.push_back(static_cast<uint32_t>(idx));
+                return;
+            }
             if (s.eid_hash == e.eid_hash) {
-                if (e.ingest_ts < s.ingest_ts) s = e;
+                if (e.ingest_ts < s.ingest_ts) {
+                    s = e;
+                    s.gen = gen;
+                }
                 return;
             }
             idx = (idx + 1) & mask;
@@ -459,22 +511,33 @@ struct FlatEventMap {
 };
 
 struct FlatClickSet {
-    std::vector<Hash128> slots;
+    struct Slot {
+        Hash128 h;
+        uint32_t gen;
+    };
+    std::vector<Slot> slots;
     size_t mask = 0;
+    uint32_t gen = 0;
 
-    void init(size_t expected) {
+    void reset(size_t expected) {
         size_t cap = 1024;
         while (cap < expected * 2) cap <<= 1;
-        slots.assign(cap, Hash128{0, 0});
-        mask = cap - 1;
+        if (slots.size() < cap) {
+            slots.assign(cap, Slot{{0, 0}, 0});
+            gen = 1;
+        } else if (++gen == 0) {
+            for (auto& s : slots) s.gen = 0;
+            gen = 1;
+        }
+        mask = slots.size() - 1;
     }
 
     inline bool insert(Hash128 h) noexcept {
         size_t idx = h.lo & mask;
         while (true) {
             auto& s = slots[idx];
-            if (s.lo == 0 && s.hi == 0) { s = h; return true; }
-            if (s == h) return false;
+            if (s.gen != gen) { s.h = h; s.gen = gen; return true; }
+            if (s.h == h) return false;
             idx = (idx + 1) & mask;
         }
     }
@@ -562,6 +625,8 @@ void write_parquet_table(const fs::path& path, const std::shared_ptr<arrow::Tabl
                      ->build();
     auto st = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out_res, 1 << 20, props);
     if (!st.ok()) { std::cerr << st.ToString() << "\n"; std::exit(1); }
+    auto cst = (*out_res)->Close();
+    if (!cst.ok()) { std::cerr << cst.ToString() << "\n"; std::exit(1); }
 }
 
 int main(int argc, char** argv) {
@@ -581,31 +646,22 @@ int main(int argc, char** argv) {
     }
     int64_t click_win_start = win_start - SEVEN_DAYS_MS;
 
-    auto for_each_line = [](const MMapFile& f, auto&& fn) {
-        if (!f.data || f.size == 0) return;
-        const char* end = f.data + f.size;
-        const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
-        if (!nl) return;
-        const char* cur = nl + 1;
-        while (cur < end) {
-            const char* next = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
-            size_t len = next ? static_cast<size_t>(next - cur) : static_cast<size_t>(end - cur);
-            fn(std::string_view(cur, len));
-            cur = next ? next + 1 : end;
-        }
-    };
-
     FlatStrMap categories;
     uint32_t unknown_cat = categories.get_id("unknown");
     FlatStrMap products;
     {
         MMapFile f;
         if (f.open(data_dir / "products.csv")) {
-            products.init(f.size / 24 + 64);
-            std::string_view c[2];
-            for_each_line(f, [&](std::string_view ln) {
-                if (parse_csv(ln, 2, c)) products.emplace_val(c[0], categories.get_id(c[1]), hash64(c[0]));
-            });
+            products.init(f.size / 24 + 64, f.size / 2 + 256);
+            const char* end = f.data + f.size;
+            const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
+            if (nl) {
+                const char* cur = nl + 1;
+                std::string_view c[2];
+                while (cur < end) {
+                    if (next_csv_line(cur, end, 2, c)) products.emplace_val(c[0], categories.get_id(c[1]), hash64(c[0]));
+                }
+            }
         }
     }
 
@@ -614,15 +670,20 @@ int main(int argc, char** argv) {
     {
         MMapFile f;
         if (f.open(data_dir / "campaigns.csv")) {
-            camp_ids.init(f.size / 24 + 64);
-            std::string_view c[2];
-            for_each_line(f, [&](std::string_view ln) {
-                if (parse_csv(ln, 2, c)) {
-                    uint32_t id = camp_ids.get_id(c[0]);
-                    if (id >= camp_channels.size()) camp_channels.resize(id + 1);
-                    camp_channels[id] = std::string(c[1]);
+            camp_ids.init(f.size / 24 + 64, f.size / 2 + 256);
+            const char* end = f.data + f.size;
+            const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
+            if (nl) {
+                const char* cur = nl + 1;
+                std::string_view c[2];
+                while (cur < end) {
+                    if (next_csv_line(cur, end, 2, c)) {
+                        uint32_t id = camp_ids.get_id(c[0]);
+                        if (id >= camp_channels.size()) camp_channels.resize(id + 1);
+                        camp_channels[id] = std::string(c[1]);
+                    }
                 }
-            });
+            }
         }
     }
 
@@ -635,12 +696,16 @@ int main(int argc, char** argv) {
             MMapFile f;
             if (f.open(p)) { lbytes += f.size; lmmaps.push_back(std::move(f)); }
         }
-        if (lbytes > 0) uf.map.init(lbytes / 20 + 64);
+        if (lbytes > 0) uf.map.init(lbytes / 20 + 64, lbytes);
         std::string_view c[2];
         for (const auto& f : lmmaps) {
-            for_each_line(f, [&](std::string_view ln) {
-                if (parse_csv(ln, 2, c) && !c[0].empty() && !c[1].empty()) uf.unite(c[0], c[1]);
-            });
+            const char* end = f.data + f.size;
+            const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
+            if (!nl) continue;
+            const char* cur = nl + 1;
+            while (cur < end) {
+                if (next_csv_line(cur, end, 2, c) && !c[0].empty() && !c[1].empty()) uf.unite(c[0], c[1]);
+            }
         }
     }
     uf.freeze();
@@ -652,7 +717,7 @@ int main(int argc, char** argv) {
         if (f.open(p)) { total_ev_bytes += f.size; event_mmaps.push_back(std::move(f)); }
     }
     auto ev_chunks = make_chunks(event_mmaps);
-    const size_t est_ev_per_bucket = total_ev_bytes / (100 * n_workers * N_SHARDS) + 64;
+    const size_t est_ev_per_bucket = total_ev_bytes / (100 * n_workers * N_SHARDS) + 32;
 
     std::vector<std::vector<std::vector<RawDedupEvent>>> ev_buckets(
         n_workers, std::vector<std::vector<RawDedupEvent>>(N_SHARDS));
@@ -668,17 +733,12 @@ int main(int argc, char** argv) {
                 const char* cur = ev_chunks[idx].begin;
                 const char* end = ev_chunks[idx].end;
                 while (cur < end) {
-                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
-                    size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
-                    std::string_view ln(cur, len);
-                    cur = nl ? nl + 1 : end;
-
-                    if (!parse_csv(ln, 7, c) || c[0].empty()) continue;
+                    if (!next_csv_line(cur, end, 7, c) || c[0].empty()) continue;
                     int64_t ingest_ts = 0;
                     if (!parse_ts(c[3], ingest_ts)) continue;
 
                     Hash128 h = hash128(c[0]);
-                    RawDedupEvent ev{h, ingest_ts, 0, {}, 0, 0, 0};
+                    RawDedupEvent ev{h, ingest_ts, 0, nullptr, 0, 0, 0, 0};
                     int64_t ts = 0;
                     if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts) &&
                         ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
@@ -689,11 +749,12 @@ int main(int argc, char** argv) {
 
                         if (ok) {
                             uint32_t cat_id = products.find(c[5]);
+                            std::string_view person = uf.canonical(c[1]);
                             ev.ts = ts;
-                            ev.person = uf.canonical(c[1]);
+                            ev.person_ptr = person.data();
+                            ev.person_len = static_cast<uint32_t>(person.size());
                             ev.category_id = (cat_id != UINT32_MAX) ? cat_id : unknown_cat;
-                            ev.price_cents = price;
-                            ev.flags = 1 | (is_purch ? 2 : 0);
+                            ev.price_flags = (static_cast<uint32_t>(price) << 2) | 1u | (is_purch ? 2u : 0u);
                         }
                     }
                     my_b[h.lo & SHARD_MASK].push_back(ev);
@@ -719,15 +780,20 @@ int main(int argc, char** argv) {
                 for (unsigned t = 0; t < n_workers; ++t) total += ev_buckets[t][s].size();
                 if (total == 0) continue;
 
-                map.init(total);
+                map.reset(total);
                 for (unsigned t = 0; t < n_workers; ++t) {
                     for (const auto& e : ev_buckets[t][s]) map.insert_or_min(e);
                     std::vector<RawDedupEvent>().swap(ev_buckets[t][s]);
                 }
-                for (const auto& e : map.slots) {
-                    if ((e.eid_hash.lo == 0 && e.eid_hash.hi == 0) || !(e.flags & 1)) continue;
-                    uint64_t ph = hash64(e.person);
-                    my_pb[ph & SHARD_MASK].push_back({ph, e.person, ValidEvent{e.ts, e.price_cents, e.category_id, (e.flags & 2) != 0}});
+                for (uint32_t slot_idx : map.used) {
+                    const auto& e = map.slots[slot_idx];
+                    if (!(e.price_flags & 1u)) continue;
+                    std::string_view person(e.person_ptr, e.person_len);
+                    uint64_t ph = hash64(person);
+                    my_pb[ph & SHARD_MASK].push_back({
+                        ph, person,
+                        ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), e.category_id, (e.price_flags & 2u) != 0}
+                    });
                 }
             }
         };
@@ -751,7 +817,7 @@ int main(int argc, char** argv) {
                 for (unsigned t = 0; t < n_workers; ++t) total += pev_buckets[t][ps].size();
                 if (total == 0) continue;
 
-                sh.people.init(total / 4 + 32);
+                sh.people.init(total / 4 + 32, total * 4 + 256);
                 pids.clear();
                 pids.reserve(total);
                 counts.clear();
@@ -799,7 +865,7 @@ int main(int argc, char** argv) {
         if (f.open(p)) { total_ck_bytes += f.size; click_mmaps.push_back(std::move(f)); }
     }
     auto ck_chunks = make_chunks(click_mmaps);
-    const size_t est_ck_per_bucket = total_ck_bytes / (80 * n_workers * N_SHARDS) + 64;
+    const size_t est_ck_per_bucket = total_ck_bytes / (80 * n_workers * N_SHARDS) + 32;
 
     std::vector<std::vector<std::vector<RawClickMsg>>> ck_buckets(
         n_workers, std::vector<std::vector<RawClickMsg>>(N_SHARDS));
@@ -815,19 +881,13 @@ int main(int argc, char** argv) {
                 const char* cur = ck_chunks[idx].begin;
                 const char* end = ck_chunks[idx].end;
                 while (cur < end) {
-                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
-                    size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
-                    std::string_view ln(cur, len);
-                    cur = nl ? nl + 1 : end;
-
-                    if (!parse_csv(ln, 4, c) || c[0].empty() || c[1].empty()) continue;
+                    if (!next_csv_line(cur, end, 4, c) || c[0].empty() || c[1].empty()) continue;
                     uint32_t camp_id = camp_ids.find(c[2]);
                     if (camp_id == UINT32_MAX) continue;
                     int64_t ts = 0;
                     if (!parse_ts(c[3], ts) || ts < click_win_start || ts >= win_end) continue;
 
-                    std::string_view person = uf.canonical(c[1]);
-                    uint64_t ph = hash64(person);
+                    auto [person, ph] = uf.canonical_with_hash(c[1]);
                     uint32_t ps = static_cast<uint32_t>(ph & SHARD_MASK);
                     uint32_t pid = pshards[ps].people.find(person, ph);
                     if (pid == UINT32_MAX) continue;
@@ -856,7 +916,7 @@ int main(int argc, char** argv) {
                 for (unsigned t = 0; t < n_workers; ++t) total += ck_buckets[t][s].size();
                 if (total == 0) continue;
 
-                seen.init(total);
+                seen.reset(total);
                 for (unsigned t = 0; t < n_workers; ++t) {
                     for (const auto& r : ck_buckets[t][s]) {
                         if (seen.insert(r.cid_hash)) {
@@ -1027,22 +1087,28 @@ int main(int argc, char** argv) {
 
         if (!urows.empty()) {
             wrote_any_user.store(true, std::memory_order_relaxed);
+            size_t uid_bytes = 0, cat_bytes = 0;
+            for (const auto& r : urows) {
+                uid_bytes += pshards[r.shard].people.id_slices[r.pid].second;
+                if (r.top_cat != UINT32_MAX) cat_bytes += categories.id_slices[r.top_cat].second;
+            }
+
             arrow::StringBuilder b_uid, b_cat;
             arrow::Date32Builder b_day;
             arrow::Int64Builder b_sess, b_evs, b_rev;
-            (void)b_uid.Reserve(urows.size()); (void)b_uid.ReserveData(urows.size() * 16);
-            (void)b_cat.Reserve(urows.size()); (void)b_cat.ReserveData(urows.size() * 12);
+            (void)b_uid.Reserve(urows.size()); (void)b_uid.ReserveData(uid_bytes);
+            (void)b_cat.Reserve(urows.size()); (void)b_cat.ReserveData(cat_bytes);
             (void)b_day.Reserve(urows.size()); (void)b_sess.Reserve(urows.size());
             (void)b_evs.Reserve(urows.size()); (void)b_rev.Reserve(urows.size());
 
             for (const auto& r : urows) {
-                (void)b_uid.Append(pshards[r.shard].people.view(r.pid));
-                (void)b_day.Append(r.day);
-                (void)b_sess.Append(r.sessions);
-                (void)b_evs.Append(r.events);
-                (void)b_rev.Append(r.revenue_cents);
-                if (r.top_cat == UINT32_MAX) (void)b_cat.AppendNull();
-                else (void)b_cat.Append(categories.view(r.top_cat));
+                b_uid.UnsafeAppend(pshards[r.shard].people.view(r.pid));
+                b_day.UnsafeAppend(r.day);
+                b_sess.UnsafeAppend(r.sessions);
+                b_evs.UnsafeAppend(r.events);
+                b_rev.UnsafeAppend(r.revenue_cents);
+                if (r.top_cat == UINT32_MAX) b_cat.UnsafeAppendNull();
+                else b_cat.UnsafeAppend(categories.view(r.top_cat));
             }
 
             std::shared_ptr<arrow::Array> a_uid, a_day, a_sess, a_evs, a_rev, a_cat;
@@ -1084,10 +1150,19 @@ int main(int argc, char** argv) {
             }
         }
 
+        size_t cid_bytes = 0, ch_bytes = 0;
+        for (const auto& s : camp_daily.slots) {
+            if (s.key == UINT64_MAX) continue;
+            uint32_t cid = static_cast<uint32_t>(s.key >> 32);
+            if (cid == UINT32_MAX) { cid_bytes += 7; ch_bytes += 7; }
+            else { cid_bytes += camp_ids.id_slices[cid].second; ch_bytes += camp_channels[cid].size(); }
+        }
+
         arrow::StringBuilder b_cid, b_ch;
         arrow::Date32Builder b_day;
         arrow::Int64Builder b_sess, b_purch, b_rev, b_ast;
-        (void)b_cid.Reserve(camp_daily.count); (void)b_ch.Reserve(camp_daily.count);
+        (void)b_cid.Reserve(camp_daily.count); (void)b_cid.ReserveData(cid_bytes);
+        (void)b_ch.Reserve(camp_daily.count); (void)b_ch.ReserveData(ch_bytes);
         (void)b_day.Reserve(camp_daily.count); (void)b_sess.Reserve(camp_daily.count);
         (void)b_purch.Reserve(camp_daily.count); (void)b_rev.Reserve(camp_daily.count);
         (void)b_ast.Reserve(camp_daily.count);
@@ -1097,13 +1172,13 @@ int main(int argc, char** argv) {
             uint32_t cid = static_cast<uint32_t>(s.key >> 32);
             int32_t day = static_cast<int32_t>(static_cast<uint32_t>(s.key));
             bool org = (cid == UINT32_MAX);
-            (void)b_cid.Append(org ? std::string_view("organic") : camp_ids.view(cid));
-            (void)b_ch.Append(org ? std::string_view("organic") : std::string_view(camp_channels[cid]));
-            (void)b_day.Append(day);
-            (void)b_sess.Append(s.val.sessions);
-            (void)b_purch.Append(s.val.purchasing);
-            (void)b_rev.Append(s.val.rev);
-            (void)b_ast.Append(s.val.assisted);
+            b_cid.UnsafeAppend(org ? std::string_view("organic") : camp_ids.view(cid));
+            b_ch.UnsafeAppend(org ? std::string_view("organic") : std::string_view(camp_channels[cid]));
+            b_day.UnsafeAppend(day);
+            b_sess.UnsafeAppend(s.val.sessions);
+            b_purch.UnsafeAppend(s.val.purchasing);
+            b_rev.UnsafeAppend(s.val.rev);
+            b_ast.UnsafeAppend(s.val.assisted);
         }
 
         std::shared_ptr<arrow::Array> a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast;
@@ -1123,5 +1198,6 @@ int main(int argc, char** argv) {
                             arrow::Table::Make(schema, {a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast}));
     }
 
-    return 0;
+    std::fflush(nullptr);
+    ::_exit(0);
 }
