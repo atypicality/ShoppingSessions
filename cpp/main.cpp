@@ -1,10 +1,13 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -374,7 +377,8 @@ int main(int argc, char** argv) {
     StringTable people;
     StringTable categories;
     std::vector<std::vector<ValidEvent>> person_events;
-    for (const auto& [eid, ev] : dedup_events) {
+    for (const auto& entry : dedup_events) {
+        const RawEvent& ev = entry.second;
         if (ev.user_id.empty() || ev.product_id.empty()) continue;
 
         int64_t ts = 0;
@@ -432,90 +436,125 @@ int main(int argc, char** argv) {
     seen_clicks.clear();
     if (person_clicks.size() < person_events.size()) person_clicks.resize(person_events.size());
 
-    // 7. Sessionize, Attribute Clicks, and Aggregate
-    std::unordered_map<std::pair<uint32_t, std::string>, UserDailyAgg, DailyKeyHash> user_daily;
-    std::unordered_map<std::pair<uint32_t, std::string>, CampaignDailyAgg, DailyKeyHash> campaign_daily;
+    // 7. Sessionize, attribute clicks, and aggregate. Each canonical person
+    // is independent, so workers use private maps and merge once at the end.
+    using UserDailyMap = std::unordered_map<std::pair<uint32_t, std::string>, UserDailyAgg, DailyKeyHash>;
+    using CampaignDailyMap = std::unordered_map<std::pair<uint32_t, std::string>, CampaignDailyAgg, DailyKeyHash>;
+
+    auto aggregate_range = [&](size_t begin, size_t end, UserDailyMap& user_local,
+                               CampaignDailyMap& campaign_local) {
+        for (size_t person_id = begin; person_id < end; ++person_id) {
+            auto& evs = person_events[person_id];
+            if (evs.empty()) continue;
+            std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) {
+                return a.ts < b.ts;
+            });
+
+            auto& clicks = person_clicks[person_id];
+            std::sort(clicks.begin(), clicks.end(), [](const ValidClick& a, const ValidClick& b) {
+                if (a.ts != b.ts) return a.ts < b.ts;
+                return a.click_id < b.click_id;
+            });
+
+            size_t L = 0, R = 0;
+            std::unordered_map<uint32_t, uint32_t> active_campaigns;
+            active_campaigns.reserve(std::min<size_t>(clicks.size(), 64));
+            size_t i = 0;
+            while (i < evs.size()) {
+                int64_t session_start = evs[i].ts;
+                std::string day = epoch_ms_to_date(session_start);
+
+                int64_t sess_rev = 0;
+                bool has_purchase = false;
+                auto& u_agg = user_local[{static_cast<uint32_t>(person_id), day}];
+                u_agg.sessions += 1;
+
+                int64_t prev_ts = session_start;
+                while (i < evs.size() && (evs[i].ts - prev_ts <= SESSION_GAP_MS)) {
+                    prev_ts = evs[i].ts;
+                    u_agg.events += 1;
+                    if (evs[i].is_purchase) {
+                        has_purchase = true;
+                        sess_rev += evs[i].price_cents;
+                        u_agg.revenue_cents += evs[i].price_cents;
+                        u_agg.cat_rev[evs[i].category_id] += evs[i].price_cents;
+                    }
+                    ++i;
+                }
+
+                while (R < clicks.size() && clicks[R].ts <= session_start) {
+                    ++active_campaigns[clicks[R].campaign_id];
+                    ++R;
+                }
+                while (L < R && clicks[L].ts < session_start - SEVEN_DAYS_MS) {
+                    auto active = active_campaigns.find(clicks[L].campaign_id);
+                    if (active != active_campaigns.end()) {
+                        if (--active->second == 0) active_campaigns.erase(active);
+                    }
+                    ++L;
+                }
+
+                if (L == R) {
+                    auto& c_agg = campaign_local[{UINT32_MAX, day}];
+                    c_agg.sessions += 1;
+                    if (has_purchase) c_agg.purchasing_sessions += 1;
+                    c_agg.revenue_cents += sess_rev;
+                } else {
+                    size_t best = R - 1;
+                    while (best > L && clicks[best - 1].ts == clicks[R - 1].ts) --best;
+
+                    auto& c_agg = campaign_local[{clicks[best].campaign_id, day}];
+                    c_agg.sessions += 1;
+                    if (has_purchase) c_agg.purchasing_sessions += 1;
+                    c_agg.revenue_cents += sess_rev;
+
+                    for (const auto& [campaign_id, count] : active_campaigns) {
+                        (void)count;
+                        campaign_local[{campaign_id, day}].assisted_sessions += 1;
+                    }
+                }
+            }
+        }
+    };
+
+    unsigned requested_workers = 0;
+    if (const char* env = std::getenv("NCPU")) {
+        try { requested_workers = static_cast<unsigned>(std::stoul(env)); }
+        catch (...) { requested_workers = 0; }
+    }
+    unsigned worker_count = requested_workers ? requested_workers : std::thread::hardware_concurrency();
+    worker_count = std::max(1u, std::min<unsigned>(worker_count, static_cast<unsigned>(std::max<size_t>(1, person_events.size()))));
+
+    std::vector<UserDailyMap> local_users(worker_count);
+    std::vector<CampaignDailyMap> local_campaigns(worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+        size_t begin = person_events.size() * worker / worker_count;
+        size_t end = person_events.size() * (worker + 1) / worker_count;
+        workers.emplace_back(aggregate_range, begin, end,
+                             std::ref(local_users[worker]), std::ref(local_campaigns[worker]));
+    }
+    for (auto& worker : workers) worker.join();
+
+    UserDailyMap user_daily;
+    CampaignDailyMap campaign_daily;
     user_daily.reserve(person_events.size());
-    campaign_daily.reserve(person_events.size());
-
-    for (uint32_t person_id = 0; person_id < person_events.size(); ++person_id) {
-        auto& evs = person_events[person_id];
-        if (evs.empty()) continue;
-        std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) {
-            return a.ts < b.ts;
-        });
-
-        auto& clicks = person_clicks[person_id];
-        std::sort(clicks.begin(), clicks.end(), [](const ValidClick& a, const ValidClick& b) {
-            if (a.ts != b.ts) return a.ts < b.ts;
-            return a.click_id < b.click_id;
-        });
-
-        size_t L = 0, R = 0;
-        // Counts of campaigns currently represented in [L, R). This lets us
-        // enumerate distinct active campaigns instead of rescanning every
-        // click in the seven-day window for every session.
-        std::unordered_map<uint32_t, uint32_t> active_campaigns;
-        active_campaigns.reserve(std::min<size_t>(clicks.size(), 64));
-        size_t i = 0;
-        while (i < evs.size()) {
-            int64_t session_start = evs[i].ts;
-            std::string day = epoch_ms_to_date(session_start);
-
-            int64_t sess_rev = 0;
-            bool has_purchase = false;
-            auto& u_agg = user_daily[{person_id, day}];
-            u_agg.sessions += 1;
-
-            // Consume all events in this session
-            int64_t prev_ts = session_start;
-            while (i < evs.size() && (evs[i].ts - prev_ts <= SESSION_GAP_MS)) {
-                prev_ts = evs[i].ts;
-                u_agg.events += 1;
-                if (evs[i].is_purchase) {
-                    has_purchase = true;
-                    sess_rev += evs[i].price_cents;
-                    u_agg.revenue_cents += evs[i].price_cents;
-                    u_agg.cat_rev[evs[i].category_id] += evs[i].price_cents;
-                }
-                ++i;
-            }
-
-            // Sliding window for clicks in [session_start - 7d, session_start]
-            while (R < clicks.size() && clicks[R].ts <= session_start) {
-                ++active_campaigns[clicks[R].campaign_id];
-                ++R;
-            }
-            while (L < R && clicks[L].ts < session_start - SEVEN_DAYS_MS) {
-                auto active = active_campaigns.find(clicks[L].campaign_id);
-                if (active != active_campaigns.end()) {
-                    if (--active->second == 0) active_campaigns.erase(active);
-                }
-                ++L;
-            }
-
-            if (L == R) {
-                auto& c_agg = campaign_daily[{UINT32_MAX, day}];
-                c_agg.sessions += 1;
-                if (has_purchase) c_agg.purchasing_sessions += 1;
-                c_agg.revenue_cents += sess_rev;
-            } else {
-                // Latest ts is clicks[R-1].ts; scan back to find smallest click_id with that ts
-                size_t best = R - 1;
-                while (best > L && clicks[best - 1].ts == clicks[R - 1].ts) --best;
-
-                auto& c_agg = campaign_daily[{clicks[best].campaign_id, day}];
-                c_agg.sessions += 1;
-                if (has_purchase) c_agg.purchasing_sessions += 1;
-                c_agg.revenue_cents += sess_rev;
-
-                // Assists: active_campaigns already contains each campaign
-                // once, regardless of how many clicks it contributed.
-                for (const auto& [campaign_id, count] : active_campaigns) {
-                    (void)count;
-                    campaign_daily[{campaign_id, day}].assisted_sessions += 1;
-                }
-            }
+    campaign_daily.reserve(campaign_ids.values.size() + 1);
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+        for (auto& [key, source] : local_users[worker]) {
+            auto& target = user_daily[key];
+            target.sessions += source.sessions;
+            target.events += source.events;
+            target.revenue_cents += source.revenue_cents;
+            for (auto& [category_id, revenue] : source.cat_rev) target.cat_rev[category_id] += revenue;
+        }
+        for (auto& [key, source] : local_campaigns[worker]) {
+            auto& target = campaign_daily[key];
+            target.sessions += source.sessions;
+            target.purchasing_sessions += source.purchasing_sessions;
+            target.revenue_cents += source.revenue_cents;
+            target.assisted_sessions += source.assisted_sessions;
         }
     }
 

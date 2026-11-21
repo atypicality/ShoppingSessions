@@ -7,6 +7,25 @@ import duckdb
 
 # the main idea here is to be able to take special parameters for testing
 # this now supports CLI arguments (for local testing) and environment variables (for Docker):
+def copy_csv_to_parquet(source: Path, destination: Path, columns: str, select_list: str) -> None:
+    con = duckdb.connect()
+    try:
+        con.execute(f"""
+            COPY (
+                SELECT {select_list}
+                FROM read_csv(
+                    '{source.as_posix()}',
+                    header=true,
+                    delim=',',
+                    quote='"',
+                    columns={{{columns}}}
+                )
+            ) TO '{destination.as_posix()}' (FORMAT PARQUET);
+        """)
+    finally:
+        con.close()
+
+
 def main() -> None:
     if len(sys.argv) >= 3:
         data_dir = Path(sys.argv[1])
@@ -45,62 +64,16 @@ def main() -> None:
     user_out.mkdir(parents=True, exist_ok=True)
     campaign_out.mkdir(parents=True, exist_ok=True)
 
-    # Convert the two aggregated CSVs to Parquet with exact schemas
-    con = duckdb.connect()
-    con.execute(f"""
-        COPY (
-            SELECT
-                user_id::VARCHAR AS user_id,
-                day::DATE AS day,
-                sessions::BIGINT AS sessions,
-                events::BIGINT AS events,
-                revenue_cents::BIGINT AS revenue_cents,
-                CASE WHEN top_category = '' THEN NULL ELSE top_category END::VARCHAR AS top_category
-            FROM read_csv(
-                '{user_csv.as_posix()}',
-                header=true,
-                delim=',',
-                quote='"',
-                nullstr='',
-                columns={{
-                    'user_id': 'VARCHAR',
-                    'day': 'VARCHAR',
-                    'sessions': 'BIGINT',
-                    'events': 'BIGINT',
-                    'revenue_cents': 'BIGINT',
-                    'top_category': 'VARCHAR'
-                }}
-            )
-        ) TO '{(user_out / "part-0.parquet").as_posix()}' (FORMAT PARQUET);
-    """)
-
-    con.execute(f"""
-        COPY (
-            SELECT
-                campaign_id::VARCHAR AS campaign_id,
-                channel::VARCHAR AS channel,
-                day::DATE AS day,
-                sessions::BIGINT AS sessions,
-                purchasing_sessions::BIGINT AS purchasing_sessions,
-                revenue_cents::BIGINT AS revenue_cents,
-                assisted_sessions::BIGINT AS assisted_sessions
-            FROM read_csv(
-                '{campaign_csv.as_posix()}',
-                header=true,
-                delim=',',
-                quote='"',
-                columns={{
-                    'campaign_id': 'VARCHAR',
-                    'channel': 'VARCHAR',
-                    'day': 'VARCHAR',
-                    'sessions': 'BIGINT',
-                    'purchasing_sessions': 'BIGINT',
-                    'revenue_cents': 'BIGINT',
-                    'assisted_sessions': 'BIGINT'
-                }}
-            )
-        ) TO '{(campaign_out / "part-0.parquet").as_posix()}' (FORMAT PARQUET);
-    """)
+    copy_csv_to_parquet(
+        user_csv, user_out / "part-0.parquet",
+        "'user_id': 'VARCHAR', 'day': 'VARCHAR', 'sessions': 'BIGINT', 'events': 'BIGINT', 'revenue_cents': 'BIGINT', 'top_category': 'VARCHAR'",
+        "user_id::VARCHAR AS user_id, day::DATE AS day, sessions::BIGINT AS sessions, events::BIGINT AS events, revenue_cents::BIGINT AS revenue_cents, CASE WHEN top_category = '' THEN NULL ELSE top_category END::VARCHAR AS top_category",
+    )
+    copy_csv_to_parquet(
+        campaign_csv, campaign_out / "part-0.parquet",
+        "'campaign_id': 'VARCHAR', 'channel': 'VARCHAR', 'day': 'VARCHAR', 'sessions': 'BIGINT', 'purchasing_sessions': 'BIGINT', 'revenue_cents': 'BIGINT', 'assisted_sessions': 'BIGINT'",
+        "campaign_id::VARCHAR AS campaign_id, channel::VARCHAR AS channel, day::DATE AS day, sessions::BIGINT AS sessions, purchasing_sessions::BIGINT AS purchasing_sessions, revenue_cents::BIGINT AS revenue_cents, assisted_sessions::BIGINT AS assisted_sessions",
+    )
 
 
 if __name__ == "__main__":
