@@ -60,8 +60,8 @@ jobs:
         if: ${{ hashFiles('fixtures/**') != '' }}
         env:
           IMAGE: shopping-sessions:ci
-          CPUS: "8"
-          MEM: 24g
+          CPUS: "4"
+          MEM: 8g
           PLATFORM: linux/amd64
         run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
 
