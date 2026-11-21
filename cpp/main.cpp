@@ -1,10 +1,13 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -209,6 +212,22 @@ struct UnionFind {
     }
 };
 
+// Intern repeated dimensions once. Events and clicks can then refer to a
+// compact integer while the original spelling remains available for output.
+struct StringTable {
+    std::unordered_map<std::string, uint32_t> ids;
+    std::vector<std::string> values;
+
+    uint32_t get(std::string value) {
+        auto it = ids.find(value);
+        if (it != ids.end()) return it->second;
+        uint32_t id = static_cast<uint32_t>(values.size());
+        values.push_back(std::move(value));
+        ids.emplace(values.back(), id);
+        return id;
+    }
+};
+
 // -------------------- Data Structures --------------------
 
 struct RawEvent {
@@ -224,20 +243,20 @@ struct ValidEvent {
     int64_t ts;
     int64_t price_cents; // 0 for view/cart
     bool is_purchase;
-    std::string category;
+    uint32_t category_id;
 };
 
 struct ValidClick {
     int64_t ts;
     std::string click_id;
-    std::string campaign_id;
+    uint32_t campaign_id;
 };
 
 struct UserDailyAgg {
     int64_t sessions = 0;
     int64_t events = 0;
     int64_t revenue_cents = 0;
-    std::unordered_map<std::string, int64_t> cat_rev;
+    std::unordered_map<uint32_t, int64_t> cat_rev;
 };
 
 struct CampaignDailyAgg {
@@ -248,11 +267,11 @@ struct CampaignDailyAgg {
 };
 
 // Output order is explicitly not significant. Hashing the daily keys avoids
-// the pointer chasing and log(N) tree operations of std::map while the large
-// event stream is being aggregated.
+// pointer chasing and log(N) tree operations while the event stream is being
+// aggregated. Both daily aggregates use the same key shape.
 struct DailyKeyHash {
-    size_t operator()(const std::pair<std::string, std::string>& key) const noexcept {
-        const size_t h1 = std::hash<std::string>{}(key.first);
+    size_t operator()(const std::pair<uint32_t, std::string>& key) const noexcept {
+        const size_t h1 = std::hash<uint32_t>{}(key.first);
         const size_t h2 = std::hash<std::string>{}(key.second);
         return h1 ^ (h2 + static_cast<size_t>(0x9e3779b97f4a7c15ULL) +
                      (h1 << 6) + (h1 >> 2));
@@ -301,13 +320,16 @@ int main(int argc, char** argv) {
     }
 
     // 2. Load campaigns.csv
-    std::unordered_map<std::string, std::string> campaigns;
+    StringTable campaign_ids;
+    std::vector<std::string> campaign_channels;
     {
         std::ifstream in(data_dir / "campaigns.csv");
         std::getline(in, line, '\n'); // skip header
         while (std::getline(in, line, '\n')) {
             if (parse_csv_line(line, 2, cols)) {
-                campaigns.emplace(std::string(cols[0]), std::string(cols[1]));
+                uint32_t id = campaign_ids.get(std::string(cols[0]));
+                if (id >= campaign_channels.size()) campaign_channels.resize(id + 1);
+                campaign_channels[id] = std::string(cols[1]);
             }
         }
     }
@@ -352,8 +374,11 @@ int main(int argc, char** argv) {
     }
 
     // 5. Validate surviving events & group by canonical person
-    std::unordered_map<std::string, std::vector<ValidEvent>> person_events;
-    for (const auto& [eid, ev] : dedup_events) {
+    StringTable people;
+    StringTable categories;
+    std::vector<std::vector<ValidEvent>> person_events;
+    for (const auto& entry : dedup_events) {
+        const RawEvent& ev = entry.second;
         if (ev.user_id.empty() || ev.product_id.empty()) continue;
 
         int64_t ts = 0;
@@ -374,13 +399,16 @@ int main(int argc, char** argv) {
         auto pit = products.find(ev.product_id);
         if (pit != products.end()) cat = pit->second;
 
-        person_events[uf.canonical(ev.user_id)].push_back(ValidEvent{ts, price_cents, is_purchase, std::move(cat)});
+        uint32_t person_id = people.get(uf.canonical(ev.user_id));
+        if (person_id >= person_events.size()) person_events.resize(person_id + 1);
+        uint32_t category_id = categories.get(std::move(cat));
+        person_events[person_id].push_back(ValidEvent{ts, price_cents, is_purchase, category_id});
     }
     dedup_events.clear(); // free memory
 
     // 6. Parse, Dedup & Validate clicks/*.csv
     std::unordered_set<std::string> seen_clicks;
-    std::unordered_map<std::string, std::vector<ValidClick>> person_clicks;
+    std::vector<std::vector<ValidClick>> person_clicks;
     for (const auto& path : list_csvs(data_dir / "clicks")) {
         std::ifstream in(path);
         std::getline(in, line, '\n'); // skip header
@@ -391,100 +419,142 @@ int main(int argc, char** argv) {
             if (!seen_clicks.insert(cid).second) continue; // dedup
 
             if (cols[1].empty()) continue; // user_id empty
-            std::string camp_id(cols[2]);
-            if (campaigns.find(camp_id) == campaigns.end()) continue;
+            auto camp_it = campaign_ids.ids.find(std::string(cols[2]));
+            if (camp_it == campaign_ids.ids.end()) continue;
+            uint32_t campaign_id = camp_it->second;
 
             int64_t ts = 0;
             if (!parse_timestamp(cols[3], ts)) continue;
             if (ts < click_window_start || ts >= window_end) continue;
 
-            person_clicks[uf.canonical(std::string(cols[1]))].push_back(ValidClick{ts, std::move(cid), std::move(camp_id)});
+            uint32_t person_id = people.get(uf.canonical(std::string(cols[1])));
+            if (person_id >= person_events.size()) person_events.resize(person_id + 1);
+            if (person_id >= person_clicks.size()) person_clicks.resize(person_id + 1);
+            person_clicks[person_id].push_back(ValidClick{ts, std::move(cid), campaign_id});
         }
     }
     seen_clicks.clear();
+    if (person_clicks.size() < person_events.size()) person_clicks.resize(person_events.size());
 
-    // 7. Sessionize, Attribute Clicks, and Aggregate
-    std::unordered_map<std::pair<std::string, std::string>, UserDailyAgg, DailyKeyHash> user_daily;
-    std::unordered_map<std::pair<std::string, std::string>, CampaignDailyAgg, DailyKeyHash> campaign_daily;
+    // 7. Sessionize, attribute clicks, and aggregate. Each canonical person
+    // is independent, so workers use private maps and merge once at the end.
+    using UserDailyMap = std::unordered_map<std::pair<uint32_t, std::string>, UserDailyAgg, DailyKeyHash>;
+    using CampaignDailyMap = std::unordered_map<std::pair<uint32_t, std::string>, CampaignDailyAgg, DailyKeyHash>;
+
+    auto aggregate_range = [&](size_t begin, size_t end, UserDailyMap& user_local,
+                               CampaignDailyMap& campaign_local) {
+        for (size_t person_id = begin; person_id < end; ++person_id) {
+            auto& evs = person_events[person_id];
+            if (evs.empty()) continue;
+            std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) {
+                return a.ts < b.ts;
+            });
+
+            auto& clicks = person_clicks[person_id];
+            std::sort(clicks.begin(), clicks.end(), [](const ValidClick& a, const ValidClick& b) {
+                if (a.ts != b.ts) return a.ts < b.ts;
+                return a.click_id < b.click_id;
+            });
+
+            size_t L = 0, R = 0;
+            std::unordered_map<uint32_t, uint32_t> active_campaigns;
+            active_campaigns.reserve(std::min<size_t>(clicks.size(), 64));
+            size_t i = 0;
+            while (i < evs.size()) {
+                int64_t session_start = evs[i].ts;
+                std::string day = epoch_ms_to_date(session_start);
+
+                int64_t sess_rev = 0;
+                bool has_purchase = false;
+                auto& u_agg = user_local[{static_cast<uint32_t>(person_id), day}];
+                u_agg.sessions += 1;
+
+                int64_t prev_ts = session_start;
+                while (i < evs.size() && (evs[i].ts - prev_ts <= SESSION_GAP_MS)) {
+                    prev_ts = evs[i].ts;
+                    u_agg.events += 1;
+                    if (evs[i].is_purchase) {
+                        has_purchase = true;
+                        sess_rev += evs[i].price_cents;
+                        u_agg.revenue_cents += evs[i].price_cents;
+                        u_agg.cat_rev[evs[i].category_id] += evs[i].price_cents;
+                    }
+                    ++i;
+                }
+
+                while (R < clicks.size() && clicks[R].ts <= session_start) {
+                    ++active_campaigns[clicks[R].campaign_id];
+                    ++R;
+                }
+                while (L < R && clicks[L].ts < session_start - SEVEN_DAYS_MS) {
+                    auto active = active_campaigns.find(clicks[L].campaign_id);
+                    if (active != active_campaigns.end()) {
+                        if (--active->second == 0) active_campaigns.erase(active);
+                    }
+                    ++L;
+                }
+
+                if (L == R) {
+                    auto& c_agg = campaign_local[{UINT32_MAX, day}];
+                    c_agg.sessions += 1;
+                    if (has_purchase) c_agg.purchasing_sessions += 1;
+                    c_agg.revenue_cents += sess_rev;
+                } else {
+                    size_t best = R - 1;
+                    while (best > L && clicks[best - 1].ts == clicks[R - 1].ts) --best;
+
+                    auto& c_agg = campaign_local[{clicks[best].campaign_id, day}];
+                    c_agg.sessions += 1;
+                    if (has_purchase) c_agg.purchasing_sessions += 1;
+                    c_agg.revenue_cents += sess_rev;
+
+                    for (const auto& [campaign_id, count] : active_campaigns) {
+                        (void)count;
+                        campaign_local[{campaign_id, day}].assisted_sessions += 1;
+                    }
+                }
+            }
+        }
+    };
+
+    unsigned requested_workers = 0;
+    if (const char* env = std::getenv("NCPU")) {
+        try { requested_workers = static_cast<unsigned>(std::stoul(env)); }
+        catch (...) { requested_workers = 0; }
+    }
+    unsigned worker_count = requested_workers ? requested_workers : std::thread::hardware_concurrency();
+    worker_count = std::max(1u, std::min<unsigned>(worker_count, static_cast<unsigned>(std::max<size_t>(1, person_events.size()))));
+
+    std::vector<UserDailyMap> local_users(worker_count);
+    std::vector<CampaignDailyMap> local_campaigns(worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+        size_t begin = person_events.size() * worker / worker_count;
+        size_t end = person_events.size() * (worker + 1) / worker_count;
+        workers.emplace_back(aggregate_range, begin, end,
+                             std::ref(local_users[worker]), std::ref(local_campaigns[worker]));
+    }
+    for (auto& worker : workers) worker.join();
+
+    UserDailyMap user_daily;
+    CampaignDailyMap campaign_daily;
     user_daily.reserve(person_events.size());
-    campaign_daily.reserve(person_events.size());
-
-    for (auto& [person, evs] : person_events) {
-        std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) {
-            return a.ts < b.ts;
-        });
-
-        auto& clicks = person_clicks[person];
-        std::sort(clicks.begin(), clicks.end(), [](const ValidClick& a, const ValidClick& b) {
-            if (a.ts != b.ts) return a.ts < b.ts;
-            return a.click_id < b.click_id;
-        });
-
-        size_t L = 0, R = 0;
-        // Counts of campaigns currently represented in [L, R). This lets us
-        // enumerate distinct active campaigns instead of rescanning every
-        // click in the seven-day window for every session.
-        std::unordered_map<std::string, uint32_t> active_campaigns;
-        active_campaigns.reserve(std::min<size_t>(clicks.size(), 64));
-        size_t i = 0;
-        while (i < evs.size()) {
-            int64_t session_start = evs[i].ts;
-            std::string day = epoch_ms_to_date(session_start);
-
-            int64_t sess_rev = 0;
-            bool has_purchase = false;
-            auto& u_agg = user_daily[{person, day}];
-            u_agg.sessions += 1;
-
-            // Consume all events in this session
-            int64_t prev_ts = session_start;
-            while (i < evs.size() && (evs[i].ts - prev_ts <= SESSION_GAP_MS)) {
-                prev_ts = evs[i].ts;
-                u_agg.events += 1;
-                if (evs[i].is_purchase) {
-                    has_purchase = true;
-                    sess_rev += evs[i].price_cents;
-                    u_agg.revenue_cents += evs[i].price_cents;
-                    u_agg.cat_rev[evs[i].category] += evs[i].price_cents;
-                }
-                ++i;
-            }
-
-            // Sliding window for clicks in [session_start - 7d, session_start]
-            while (R < clicks.size() && clicks[R].ts <= session_start) {
-                ++active_campaigns[clicks[R].campaign_id];
-                ++R;
-            }
-            while (L < R && clicks[L].ts < session_start - SEVEN_DAYS_MS) {
-                auto active = active_campaigns.find(clicks[L].campaign_id);
-                if (active != active_campaigns.end()) {
-                    if (--active->second == 0) active_campaigns.erase(active);
-                }
-                ++L;
-            }
-
-            if (L == R) {
-                auto& c_agg = campaign_daily[{"organic", day}];
-                c_agg.sessions += 1;
-                if (has_purchase) c_agg.purchasing_sessions += 1;
-                c_agg.revenue_cents += sess_rev;
-            } else {
-                // Latest ts is clicks[R-1].ts; scan back to find smallest click_id with that ts
-                size_t best = R - 1;
-                while (best > L && clicks[best - 1].ts == clicks[R - 1].ts) --best;
-
-                auto& c_agg = campaign_daily[{clicks[best].campaign_id, day}];
-                c_agg.sessions += 1;
-                if (has_purchase) c_agg.purchasing_sessions += 1;
-                c_agg.revenue_cents += sess_rev;
-
-                // Assists: active_campaigns already contains each campaign
-                // once, regardless of how many clicks it contributed.
-                for (const auto& [campaign_id, count] : active_campaigns) {
-                    (void)count;
-                    campaign_daily[{campaign_id, day}].assisted_sessions += 1;
-                }
-            }
+    campaign_daily.reserve(campaign_ids.values.size() + 1);
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+        for (auto& [key, source] : local_users[worker]) {
+            auto& target = user_daily[key];
+            target.sessions += source.sessions;
+            target.events += source.events;
+            target.revenue_cents += source.revenue_cents;
+            for (auto& [category_id, revenue] : source.cat_rev) target.cat_rev[category_id] += revenue;
+        }
+        for (auto& [key, source] : local_campaigns[worker]) {
+            auto& target = campaign_daily[key];
+            target.sessions += source.sessions;
+            target.purchasing_sessions += source.purchasing_sessions;
+            target.revenue_cents += source.revenue_cents;
+            target.assisted_sessions += source.assisted_sessions;
         }
     }
 
@@ -495,13 +565,14 @@ int main(int argc, char** argv) {
         for (const auto& [key, agg] : user_daily) {
             std::string top_cat;
             int64_t best_rev = -1;
-            for (const auto& [cat, rev] : agg.cat_rev) {
+            for (const auto& [category_id, rev] : agg.cat_rev) {
+                const std::string& cat = categories.values[category_id];
                 if (rev > best_rev || (rev == best_rev && cat < top_cat)) {
                     best_rev = rev;
                     top_cat = cat;
                 }
             }
-            out << '"' << key.first << "\"," << key.second << ','
+            out << '"' << people.values[key.first] << "\"," << key.second << ','
                 << agg.sessions << ',' << agg.events << ',' << agg.revenue_cents << ',';
             if (!top_cat.empty()) out << '"' << top_cat << '"';
             out << '\n';
@@ -512,8 +583,9 @@ int main(int argc, char** argv) {
         std::ofstream out(campaign_out_path);
         out << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
         for (const auto& [key, agg] : campaign_daily) {
-            const std::string& camp_id = key.first;
-            std::string channel = (camp_id == "organic") ? "organic" : campaigns[camp_id];
+            const bool organic = key.first == UINT32_MAX;
+            const std::string camp_id = organic ? "organic" : campaign_ids.values[key.first];
+            const std::string& channel = organic ? camp_id : campaign_channels[key.first];
             out << '"' << camp_id << "\",\"" << channel << "\"," << key.second << ','
                 << agg.sessions << ',' << agg.purchasing_sessions << ','
                 << agg.revenue_cents << ',' << agg.assisted_sessions << '\n';

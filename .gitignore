@@ -25,6 +25,9 @@ scratch/
 # Rust build output
 target/
 
+# Locally compiled C++ binary; Docker builds it from cpp/main.cpp
+cpp/pipeline
+
 # Generated datasets
 generated-data/
 data-generated/

@@ -3,14 +3,15 @@ Application for Databricks' Builders Hackathon
 
 # Shopping Sessions: DuckDB starter
 
-This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+This repository builds a `linux/amd64` image with a C++20 processing engine and DuckDB for Parquet output. It runs inside the scorer's container limits, reads the inputs, and writes both output tables with the required schema.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
 ## What to do first
 
 - Read `rules.md` for the full rules.
-- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
+- Implement the processing rules in `cpp/main.cpp`.
+- `pipeline/pipeline2.py` launches the compiled C++ engine and converts its intermediate results to Parquet.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -37,11 +38,13 @@ If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make
 - **x86 Linux and Windows machines.** Build and run the amd64 image natively.
 - **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
 
-To iterate without Docker:
+The normal and scorer-equivalent workflow is Docker-based. The C++ binary is compiled during the Docker build, so a locally compiled binary is not required.
+
+To run the fixture harness after building the image:
 
 ```sh
-pip install duckdb==1.5.6
-python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+python3 -m pip install polars
+IMAGE=shopping-sessions:latest python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
 ```
 
 ## Submitting and scoring
@@ -80,7 +83,8 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files in this starter
 
-- `pipeline/pipeline.py` holds your pipeline code.
+- `cpp/main.cpp` holds the processing engine.
+- `pipeline/pipeline2.py` launches the engine and writes Parquet output.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
 - `scripts/` runs your image the way the scorer does and diffs the output.
