@@ -250,6 +250,18 @@ struct CampaignDailyAgg {
     int64_t assisted_sessions = 0;
 };
 
+// Output order is explicitly not significant. Hashing the daily keys avoids
+// the pointer chasing and log(N) tree operations of std::map while the large
+// event stream is being aggregated.
+struct DailyKeyHash {
+    size_t operator()(const std::pair<std::string, std::string>& key) const noexcept {
+        const size_t h1 = std::hash<std::string>{}(key.first);
+        const size_t h2 = std::hash<std::string>{}(key.second);
+        return h1 ^ (h2 + static_cast<size_t>(0x9e3779b97f4a7c15ULL) +
+                     (h1 << 6) + (h1 >> 2));
+    }
+};
+
 std::vector<fs::path> list_csvs(const fs::path& dir) {
     std::vector<fs::path> files;
     if (!fs::exists(dir)) return files;
@@ -395,8 +407,10 @@ int main(int argc, char** argv) {
     seen_clicks.clear();
 
     // 7. Sessionize, Attribute Clicks, and Aggregate
-    std::map<std::pair<std::string, std::string>, UserDailyAgg> user_daily;
-    std::map<std::pair<std::string, std::string>, CampaignDailyAgg> campaign_daily;
+    std::unordered_map<std::pair<std::string, std::string>, UserDailyAgg, DailyKeyHash> user_daily;
+    std::unordered_map<std::pair<std::string, std::string>, CampaignDailyAgg, DailyKeyHash> campaign_daily;
+    user_daily.reserve(person_events.size());
+    campaign_daily.reserve(person_events.size());
 
     for (auto& [person, evs] : person_events) {
         std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) {
@@ -410,6 +424,11 @@ int main(int argc, char** argv) {
         });
 
         size_t L = 0, R = 0;
+        // Counts of campaigns currently represented in [L, R). This lets us
+        // enumerate distinct active campaigns instead of rescanning every
+        // click in the seven-day window for every session.
+        std::unordered_map<std::string, uint32_t> active_campaigns;
+        active_campaigns.reserve(std::min<size_t>(clicks.size(), 64));
         size_t i = 0;
         while (i < evs.size()) {
             int64_t session_start = evs[i].ts;
@@ -437,8 +456,17 @@ int main(int argc, char** argv) {
             }
 
             // Sliding window for clicks in [session_start - 7d, session_start]
-            while (R < clicks.size() && clicks[R].ts <= session_start) ++R;
-            while (L < R && clicks[L].ts < session_start - SEVEN_DAYS_MS) ++L;
+            while (R < clicks.size() && clicks[R].ts <= session_start) {
+                ++active_campaigns[clicks[R].campaign_id];
+                ++R;
+            }
+            while (L < R && clicks[L].ts < session_start - SEVEN_DAYS_MS) {
+                auto active = active_campaigns.find(clicks[L].campaign_id);
+                if (active != active_campaigns.end()) {
+                    if (--active->second == 0) active_campaigns.erase(active);
+                }
+                ++L;
+            }
 
             if (L == R) {
                 auto& c_agg = campaign_daily[{"organic", day}];
@@ -455,12 +483,11 @@ int main(int argc, char** argv) {
                 if (has_purchase) c_agg.purchasing_sessions += 1;
                 c_agg.revenue_cents += sess_rev;
 
-                // Assists: distinct campaigns in [L, R)
-                std::unordered_set<std::string_view> assisted;
-                for (size_t k = L; k < R; ++k) {
-                    if (assisted.insert(clicks[k].campaign_id).second) {
-                        campaign_daily[{clicks[k].campaign_id, day}].assisted_sessions += 1;
-                    }
+                // Assists: active_campaigns already contains each campaign
+                // once, regardless of how many clicks it contributed.
+                for (const auto& [campaign_id, count] : active_campaigns) {
+                    (void)count;
+                    campaign_daily[{campaign_id, day}].assisted_sessions += 1;
                 }
             }
         }
