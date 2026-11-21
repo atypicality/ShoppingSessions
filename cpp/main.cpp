@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,9 +26,10 @@ namespace fs = std::filesystem;
 constexpr int64_t MS_PER_SEC = 1000LL, MS_PER_MIN = 60LL * MS_PER_SEC,
                   MS_PER_HOUR = 60LL * MS_PER_MIN, MS_PER_DAY = 24LL * MS_PER_HOUR,
                   SESSION_GAP_MS = 30LL * MS_PER_MIN, SEVEN_DAYS_MS = 7LL * MS_PER_DAY;
-constexpr size_t N_SHARDS = 256;
+constexpr size_t N_SHARDS = 64;
 constexpr size_t SHARD_MASK = N_SHARDS - 1;
 constexpr size_t CHUNK_BYTES = 4 << 20;
+constexpr uint32_t ORGANIC_CID = UINT32_MAX - 1;
 
 inline uint64_t mix64(uint64_t x) noexcept {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
@@ -175,6 +177,45 @@ struct FlatStrMap {
     }
 };
 
+struct ProductTable {
+    static constexpr uint32_t MAX_FAST_ID = 2000000;
+    std::vector<uint32_t> fast;
+    FlatStrMap fallback;
+
+    static inline bool parse_p_id(std::string_view s, uint32_t& out) noexcept {
+        const size_t sz = s.size();
+        if (sz < 2 || sz > 8 || s[0] != 'p') return false;
+        if (sz > 2 && s[1] == '0') return false;
+        uint32_t v = 0;
+        for (size_t i = 1; i < sz; ++i) {
+            unsigned d = static_cast<unsigned char>(s[i] - '0');
+            if (d > 9) return false;
+            v = v * 10 + d;
+        }
+        if (v >= MAX_FAST_ID) return false;
+        out = v;
+        return true;
+    }
+
+    void insert(std::string_view pid, uint32_t cat_id) {
+        uint32_t idx;
+        if (parse_p_id(pid, idx)) {
+            if (idx >= fast.size()) fast.resize(idx + 1, UINT32_MAX);
+            if (fast[idx] == UINT32_MAX) fast[idx] = cat_id;
+        } else {
+            fallback.emplace_val(pid, cat_id, hash64(pid));
+        }
+    }
+
+    inline uint32_t find(std::string_view pid) const noexcept {
+        uint32_t idx;
+        if (parse_p_id(pid, idx)) {
+            return (idx < fast.size()) ? fast[idx] : UINT32_MAX;
+        }
+        return fallback.find(pid);
+    }
+};
+
 struct MMapFile {
     const char* data = nullptr;
     size_t size = 0;
@@ -227,51 +268,24 @@ std::vector<ByteChunk> make_chunks(const std::vector<MMapFile>& files) {
     return chunks;
 }
 
-inline bool next_csv_line(const char*& cur, const char* end, size_t n, std::string_view* out) noexcept {
-    const char* p = cur;
-    if (p >= end) return false;
-    if (*p == '\n') { cur = p + 1; return false; }
-
-    size_t idx = 0;
-    bool ok = true;
+inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) noexcept {
+    const size_t len = line.size();
+    if (len == 0) return false;
+    const char* p = line.data();
+    size_t idx = 0, start = 0;
     while (true) {
-        const char* fstart = p;
-        if (p < end && __builtin_expect(*p == '"', 0)) {
-            ++p;
-            while (p < end && *p != ',' && *p != '\n' && *p != '"') ++p;
-            if (p < end && *p == '"') {
-                const char* qend = p;
-                ++p;
-                if (p < end && *p != ',' && *p != '\n') {
-                    while (p < end && *p != '\n') ++p;
-                    cur = (p < end) ? p + 1 : end;
-                    return false;
-                }
-                if (idx < n) out[idx++] = std::string_view(fstart + 1, static_cast<size_t>(qend - (fstart + 1)));
-                else ok = false;
-            } else {
-                while (p < end && *p != '\n') ++p;
-                cur = (p < end) ? p + 1 : end;
-                return false;
-            }
-        } else {
-            while (p < end && *p != ',' && *p != '\n') {
-                if (__builtin_expect(*p == '"', 0)) {
-                    while (p < end && *p != '\n') ++p;
-                    cur = (p < end) ? p + 1 : end;
-                    return false;
-                }
-                ++p;
-            }
-            if (idx < n) out[idx++] = std::string_view(fstart, static_cast<size_t>(p - fstart));
-            else ok = false;
+        const char* comma = static_cast<const char*>(std::memchr(p + start, ',', len - start));
+        size_t flen = comma ? static_cast<size_t>(comma - (p + start)) : (len - start);
+        const char* fp = p + start;
+        if (flen >= 2 && fp[0] == '"' && fp[flen - 1] == '"') {
+            fp += 1;
+            flen -= 2;
         }
-
-        if (p >= end || *p == '\n') {
-            cur = (p < end) ? p + 1 : end;
-            return ok && idx == n;
-        }
-        ++p;
+        if (flen > 0 && __builtin_expect(std::memchr(fp, '"', flen) != nullptr, 0)) return false;
+        if (idx >= n) return false;
+        out[idx++] = std::string_view(fp, flen);
+        if (!comma) return idx == n;
+        start = static_cast<size_t>(comma - p) + 1;
     }
 }
 
@@ -292,18 +306,20 @@ inline bool parse_2d(const char* p, int& out) noexcept {
     return true;
 }
 
-inline bool parse_ts(std::string_view s, int64_t& out) noexcept {
+struct DateCache {
+    char date[10] = {};
+    int64_t day_ms = 0;
+};
+
+inline bool parse_ts(std::string_view s, int64_t& out, DateCache& dc) noexcept {
     const size_t sz = s.size();
     if (sz == 0) return false;
     const char* p = s.data();
 
     if ((sz == 20 || sz == 25) && p[4] == '-' && p[7] == '-' && p[10] == 'T' && p[13] == ':' && p[16] == ':') {
-        thread_local char cached_date[10] = {};
-        thread_local int64_t cached_day_ms = 0;
-
         int64_t day_ms;
-        if (std::memcmp(p, cached_date, 10) == 0) {
-            day_ms = cached_day_ms;
+        if (std::memcmp(p, dc.date, 10) == 0) {
+            day_ms = dc.day_ms;
         } else {
             int y1, y2, mo, d;
             if (!parse_2d(p, y1) || !parse_2d(p + 2, y2) || !parse_2d(p + 5, mo) || !parse_2d(p + 8, d)) return false;
@@ -312,8 +328,8 @@ inline bool parse_ts(std::string_view s, int64_t& out) noexcept {
             int dim = (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) ? 29 : (mo >= 1 && mo <= 12 ? mdays[mo] : 0);
             if (mo < 1 || mo > 12 || d < 1 || d > dim) return false;
             day_ms = days_from_civil(y, mo, d) * MS_PER_DAY;
-            std::memcpy(cached_date, p, 10);
-            cached_day_ms = day_ms;
+            std::memcpy(dc.date, p, 10);
+            dc.day_ms = day_ms;
         }
 
         int h, mi, sec;
@@ -345,6 +361,11 @@ inline bool parse_ts(std::string_view s, int64_t& out) noexcept {
     }
     out = v;
     return true;
+}
+
+inline bool parse_ts(std::string_view s, int64_t& out) noexcept {
+    DateCache dc;
+    return parse_ts(s, out, dc);
 }
 
 inline bool parse_price(std::string_view s, int32_t& out) noexcept {
@@ -380,9 +401,9 @@ struct UnionFind {
     std::vector<uint32_t> min_idx;
     std::vector<uint64_t> root_hash;
 
-    uint32_t get_or_add(std::string_view sv) {
+    uint32_t get_or_add(std::string_view sv, uint64_t h) {
         uint32_t old_n = static_cast<uint32_t>(map.id_slices.size());
-        uint32_t idx = map.get_id(sv);
+        uint32_t idx = map.get_id(sv, h);
         if (idx == old_n) {
             parent.push_back(idx);
             min_idx.push_back(idx);
@@ -395,8 +416,8 @@ struct UnionFind {
         while (parent[x] != r) { uint32_t n = parent[x]; parent[x] = r; x = n; }
         return r;
     }
-    void unite(std::string_view a, std::string_view b) {
-        uint32_t ra = find(get_or_add(a)), rb = find(get_or_add(b));
+    void unite(std::string_view a, uint64_t ha, std::string_view b, uint64_t hb) {
+        uint32_t ra = find(get_or_add(a, ha)), rb = find(get_or_add(b, hb));
         if (ra == rb) return;
         parent[rb] = ra;
         if (map.view(min_idx[rb]) < map.view(min_idx[ra])) min_idx[ra] = min_idx[rb];
@@ -408,13 +429,7 @@ struct UnionFind {
             if (parent[i] == i) root_hash[i] = hash64(map.view(min_idx[i]));
         }
     }
-    inline std::string_view canonical(std::string_view sv) const noexcept {
-        if (map.count == 0) return sv;
-        uint32_t idx = map.find(sv);
-        return (idx == UINT32_MAX) ? sv : map.view(min_idx[parent[idx]]);
-    }
-    inline std::pair<std::string_view, uint64_t> canonical_with_hash(std::string_view sv) const noexcept {
-        uint64_t h = hash64(sv);
+    inline std::pair<std::string_view, uint64_t> canonical_with_hash_prehashed(std::string_view sv, uint64_t h) const noexcept {
         if (map.count == 0) return {sv, h};
         uint32_t idx = map.find(sv, h);
         if (idx == UINT32_MAX) return {sv, h};
@@ -427,11 +442,9 @@ struct RawDedupEvent {
     Hash128 eid_hash;
     int64_t ingest_ts;
     int64_t ts;
-    const char* person_ptr;
-    uint32_t person_len;
-    uint32_t category_id;
+    const char* user_ptr;
+    uint32_t ulen_cat;
     uint32_t price_flags;
-    uint32_t gen;
 };
 
 struct ValidEvent {
@@ -468,8 +481,13 @@ struct PersonClickMsg {
 };
 
 struct FlatEventMap {
-    std::vector<RawDedupEvent> slots;
-    std::vector<uint32_t> used;
+    struct Slot {
+        uint64_t h_lo;
+        uint32_t idx;
+        uint32_t gen;
+    };
+    std::vector<Slot> slots;
+    std::vector<RawDedupEvent> payloads;
     size_t mask = 0;
     uint32_t gen = 0;
 
@@ -477,35 +495,33 @@ struct FlatEventMap {
         size_t cap = 1024;
         while (cap < expected * 2) cap <<= 1;
         if (slots.size() < cap) {
-            slots.assign(cap, RawDedupEvent{{0, 0}, 0, 0, nullptr, 0, 0, 0, 0});
+            slots.assign(cap, Slot{0, 0, 0});
             gen = 1;
         } else if (++gen == 0) {
             for (auto& s : slots) s.gen = 0;
             gen = 1;
         }
         mask = slots.size() - 1;
-        used.clear();
-        if (used.capacity() < expected) used.reserve(expected);
+        payloads.clear();
+        if (payloads.capacity() < expected) payloads.reserve(expected);
     }
 
     inline void insert_or_min(const RawDedupEvent& e) noexcept {
-        size_t idx = e.eid_hash.lo & mask;
+        size_t pos = e.eid_hash.lo & mask;
         while (true) {
-            auto& s = slots[idx];
+            auto& s = slots[pos];
             if (s.gen != gen) {
-                s = e;
+                s.h_lo = e.eid_hash.lo;
+                s.idx = static_cast<uint32_t>(payloads.size());
                 s.gen = gen;
-                used.push_back(static_cast<uint32_t>(idx));
+                payloads.push_back(e);
                 return;
             }
-            if (s.eid_hash == e.eid_hash) {
-                if (e.ingest_ts < s.ingest_ts) {
-                    s = e;
-                    s.gen = gen;
-                }
+            if (s.h_lo == e.eid_hash.lo && payloads[s.idx].eid_hash == e.eid_hash) {
+                if (e.ingest_ts < payloads[s.idx].ingest_ts) payloads[s.idx] = e;
                 return;
             }
-            idx = (idx + 1) & mask;
+            pos = (pos + 1) & mask;
         }
     }
 };
@@ -637,6 +653,14 @@ int main(int argc, char** argv) {
     if (const char* env = std::getenv("NCPU")) if (auto v = std::atoi(env); v > 0) n_workers = v;
     n_workers = std::max(1u, n_workers);
 
+    auto t_last = std::chrono::steady_clock::now();
+    auto lap = [&](const char* name) {
+        auto now = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - t_last).count();
+        std::fprintf(stderr, "[%s] %lld ms\n", name, static_cast<long long>(ms));
+        t_last = now;
+    };
+
     int64_t win_start = 0, win_end = 0;
     {
         std::ifstream mf(data_dir / "manifest.json");
@@ -646,46 +670,50 @@ int main(int argc, char** argv) {
     }
     int64_t click_win_start = win_start - SEVEN_DAYS_MS;
 
+    auto for_each_line = [](const MMapFile& f, auto&& fn) {
+        if (!f.data || f.size == 0) return;
+        const char* end = f.data + f.size;
+        const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
+        if (!nl) return;
+        const char* cur = nl + 1;
+        while (cur < end) {
+            const char* next = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
+            size_t len = next ? static_cast<size_t>(next - cur) : static_cast<size_t>(end - cur);
+            fn(std::string_view(cur, len));
+            cur = next ? next + 1 : end;
+        }
+    };
+
     FlatStrMap categories;
     uint32_t unknown_cat = categories.get_id("unknown");
-    FlatStrMap products;
-    {
-        MMapFile f;
-        if (f.open(data_dir / "products.csv")) {
-            products.init(f.size / 24 + 64, f.size / 2 + 256);
-            const char* end = f.data + f.size;
-            const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
-            if (nl) {
-                const char* cur = nl + 1;
-                std::string_view c[2];
-                while (cur < end) {
-                    if (next_csv_line(cur, end, 2, c)) products.emplace_val(c[0], categories.get_id(c[1]), hash64(c[0]));
-                }
-            }
-        }
-    }
-
+    ProductTable products;
     FlatStrMap camp_ids;
     std::vector<std::string> camp_channels;
-    {
+
+    std::thread t_prod([&]() {
+        MMapFile f;
+        if (f.open(data_dir / "products.csv")) {
+            std::string_view c[2];
+            for_each_line(f, [&](std::string_view ln) {
+                if (parse_csv(ln, 2, c)) products.insert(c[0], categories.get_id(c[1]));
+            });
+        }
+    });
+
+    std::thread t_camp([&]() {
         MMapFile f;
         if (f.open(data_dir / "campaigns.csv")) {
             camp_ids.init(f.size / 24 + 64, f.size / 2 + 256);
-            const char* end = f.data + f.size;
-            const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
-            if (nl) {
-                const char* cur = nl + 1;
-                std::string_view c[2];
-                while (cur < end) {
-                    if (next_csv_line(cur, end, 2, c)) {
-                        uint32_t id = camp_ids.get_id(c[0]);
-                        if (id >= camp_channels.size()) camp_channels.resize(id + 1);
-                        camp_channels[id] = std::string(c[1]);
-                    }
+            std::string_view c[2];
+            for_each_line(f, [&](std::string_view ln) {
+                if (parse_csv(ln, 2, c)) {
+                    uint32_t id = camp_ids.get_id(c[0]);
+                    if (id >= camp_channels.size()) camp_channels.resize(id + 1);
+                    camp_channels[id] = std::string(c[1]);
                 }
-            }
+            });
         }
-    }
+    });
 
     UnionFind uf;
     {
@@ -696,19 +724,45 @@ int main(int argc, char** argv) {
             MMapFile f;
             if (f.open(p)) { lbytes += f.size; lmmaps.push_back(std::move(f)); }
         }
-        if (lbytes > 0) uf.map.init(lbytes / 20 + 64, lbytes);
-        std::string_view c[2];
-        for (const auto& f : lmmaps) {
-            const char* end = f.data + f.size;
-            const char* nl = static_cast<const char*>(std::memchr(f.data, '\n', f.size));
-            if (!nl) continue;
-            const char* cur = nl + 1;
-            while (cur < end) {
-                if (next_csv_line(cur, end, 2, c) && !c[0].empty() && !c[1].empty()) uf.unite(c[0], c[1]);
+        auto lchunks = make_chunks(lmmaps);
+        if (!lchunks.empty()) {
+            struct LinkPair { std::string_view a, b; uint64_t ha, hb; };
+            std::vector<std::vector<LinkPair>> l_locals(n_workers);
+            std::atomic<size_t> next_lc{0};
+            auto lworker = [&](unsigned tid) {
+                auto& out = l_locals[tid];
+                out.reserve(lbytes / (24 * n_workers) + 64);
+                std::string_view c[2];
+                while (true) {
+                    size_t idx = next_lc.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= lchunks.size()) break;
+                    const char* cur = lchunks[idx].begin;
+                    const char* end = lchunks[idx].end;
+                    while (cur < end) {
+                        const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
+                        size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
+                        std::string_view ln(cur, len);
+                        cur = nl ? nl + 1 : end;
+                        if (parse_csv(ln, 2, c) && !c[0].empty() && !c[1].empty()) {
+                            out.push_back({c[0], c[1], hash64(c[0]), hash64(c[1])});
+                        }
+                    }
+                }
+            };
+            std::vector<std::thread> ts;
+            for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(lworker, t);
+            for (auto& t : ts) t.join();
+
+            uf.map.init(lbytes / 20 + 64, lbytes);
+            for (const auto& vec : l_locals) {
+                for (const auto& lp : vec) uf.unite(lp.a, lp.ha, lp.b, lp.hb);
             }
         }
     }
     uf.freeze();
+    t_prod.join();
+    t_camp.join();
+    lap("1-3_meta_links");
 
     std::vector<MMapFile> event_mmaps;
     size_t total_ev_bytes = 0;
@@ -726,6 +780,7 @@ int main(int argc, char** argv) {
         auto worker = [&](unsigned tid) {
             auto& my_b = ev_buckets[tid];
             for (auto& b : my_b) b.reserve(est_ev_per_bucket);
+            DateCache dc;
             std::string_view c[7];
             while (true) {
                 size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -733,14 +788,19 @@ int main(int argc, char** argv) {
                 const char* cur = ev_chunks[idx].begin;
                 const char* end = ev_chunks[idx].end;
                 while (cur < end) {
-                    if (!next_csv_line(cur, end, 7, c) || c[0].empty()) continue;
+                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
+                    size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
+                    std::string_view ln(cur, len);
+                    cur = nl ? nl + 1 : end;
+
+                    if (!parse_csv(ln, 7, c) || c[0].empty()) continue;
                     int64_t ingest_ts = 0;
-                    if (!parse_ts(c[3], ingest_ts)) continue;
+                    if (!parse_ts(c[3], ingest_ts, dc)) continue;
 
                     Hash128 h = hash128(c[0]);
-                    RawDedupEvent ev{h, ingest_ts, 0, nullptr, 0, 0, 0, 0};
+                    RawDedupEvent ev{h, ingest_ts, 0, nullptr, 0, 0};
                     int64_t ts = 0;
-                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts) &&
+                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts, dc) &&
                         ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
                         bool ok = true, is_purch = false;
                         int32_t price = 0;
@@ -748,12 +808,14 @@ int main(int argc, char** argv) {
                         else if (c[4] != "view" && c[4] != "cart") ok = false;
 
                         if (ok) {
-                            uint32_t cat_id = products.find(c[5]);
-                            std::string_view person = uf.canonical(c[1]);
+                            uint32_t cat_id = unknown_cat;
+                            if (is_purch) {
+                                uint32_t found = products.find(c[5]);
+                                if (found != UINT32_MAX) cat_id = found;
+                            }
                             ev.ts = ts;
-                            ev.person_ptr = person.data();
-                            ev.person_len = static_cast<uint32_t>(person.size());
-                            ev.category_id = (cat_id != UINT32_MAX) ? cat_id : unknown_cat;
+                            ev.user_ptr = c[1].data();
+                            ev.ulen_cat = (static_cast<uint32_t>(c[1].size()) << 16) | (cat_id & 0xFFFFu);
                             ev.price_flags = (static_cast<uint32_t>(price) << 2) | 1u | (is_purch ? 2u : 0u);
                         }
                     }
@@ -765,14 +827,21 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
+    lap("4a_ev_parse");
 
     std::vector<std::vector<std::vector<PersonEventMsg>>> pev_buckets(
         n_workers, std::vector<std::vector<PersonEventMsg>>(N_SHARDS));
     {
+        const size_t est_pev_per_bucket = total_ev_bytes / (120 * n_workers * N_SHARDS) + 32;
         std::atomic<size_t> next_s{0};
+        const bool has_uf = (uf.map.count > 0);
+        const size_t uf_mask = uf.map.mask;
         auto worker = [&](unsigned tid) {
             auto& my_pb = pev_buckets[tid];
+            for (auto& b : my_pb) b.reserve(est_pev_per_bucket);
             FlatEventMap map;
+            constexpr size_t B = 16;
+            uint64_t uhashes[B];
             while (true) {
                 size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
                 if (s >= N_SHARDS) break;
@@ -781,19 +850,37 @@ int main(int argc, char** argv) {
                 if (total == 0) continue;
 
                 map.reset(total);
+                const size_t mask = map.mask;
                 for (unsigned t = 0; t < n_workers; ++t) {
-                    for (const auto& e : ev_buckets[t][s]) map.insert_or_min(e);
+                    const auto& vec = ev_buckets[t][s];
+                    const size_t n = vec.size();
+                    for (size_t i = 0; i < n; ++i) {
+                        if (i + 16 < n) __builtin_prefetch(&map.slots[vec[i + 16].eid_hash.lo & mask], 1, 1);
+                        map.insert_or_min(vec[i]);
+                    }
                     std::vector<RawDedupEvent>().swap(ev_buckets[t][s]);
                 }
-                for (uint32_t slot_idx : map.used) {
-                    const auto& e = map.slots[slot_idx];
-                    if (!(e.price_flags & 1u)) continue;
-                    std::string_view person(e.person_ptr, e.person_len);
-                    uint64_t ph = hash64(person);
-                    my_pb[ph & SHARD_MASK].push_back({
-                        ph, person,
-                        ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), e.category_id, (e.price_flags & 2u) != 0}
-                    });
+
+                const size_t np = map.payloads.size();
+                for (size_t base = 0; base < np; base += B) {
+                    const size_t lim = std::min(np, base + B);
+                    for (size_t i = base; i < lim; ++i) {
+                        const auto& e = map.payloads[i];
+                        if (!(e.price_flags & 1u)) continue;
+                        uint64_t h = hash64(std::string_view(e.user_ptr, e.ulen_cat >> 16));
+                        uhashes[i - base] = h;
+                        if (has_uf) __builtin_prefetch(&uf.map.slots[h & uf_mask], 0, 1);
+                    }
+                    for (size_t i = base; i < lim; ++i) {
+                        const auto& e = map.payloads[i];
+                        if (!(e.price_flags & 1u)) continue;
+                        std::string_view u(e.user_ptr, e.ulen_cat >> 16);
+                        auto [person, ph] = uf.canonical_with_hash_prehashed(u, uhashes[i - base]);
+                        my_pb[ph & SHARD_MASK].push_back({
+                            ph, person,
+                            ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), e.ulen_cat & 0xFFFFu, (e.price_flags & 2u) != 0}
+                        });
+                    }
                 }
             }
         };
@@ -802,6 +889,7 @@ int main(int argc, char** argv) {
         for (auto& t : ts) t.join();
     }
     ev_buckets.clear();
+    lap("4b_ev_dedup");
 
     std::vector<PersonShard> pshards(N_SHARDS);
     {
@@ -857,6 +945,7 @@ int main(int argc, char** argv) {
     }
     pev_buckets.clear();
     event_mmaps.clear();
+    lap("4c_pshards");
 
     std::vector<MMapFile> click_mmaps;
     size_t total_ck_bytes = 0;
@@ -871,36 +960,77 @@ int main(int argc, char** argv) {
         n_workers, std::vector<std::vector<RawClickMsg>>(N_SHARDS));
     {
         std::atomic<size_t> next_chunk{0};
+        const bool has_uf = (uf.map.count > 0);
+        const size_t uf_mask = uf.map.mask;
         auto worker = [&](unsigned tid) {
             auto& my_b = ck_buckets[tid];
             for (auto& b : my_b) b.reserve(est_ck_per_bucket);
+            DateCache dc;
             std::string_view c[4];
+
+            constexpr size_t B = 32;
+            struct PendingClick {
+                std::string_view cid, user, person;
+                uint64_t uhash, ph;
+                int64_t ts;
+                uint32_t camp_id, ps;
+            };
+            PendingClick pend[B];
+            size_t n_pend = 0;
+
+            auto flush_pending = [&]() {
+                if (n_pend == 0) return;
+                if (has_uf) {
+                    for (size_t k = 0; k < n_pend; ++k) {
+                        __builtin_prefetch(&uf.map.slots[pend[k].uhash & uf_mask], 0, 1);
+                    }
+                }
+                for (size_t k = 0; k < n_pend; ++k) {
+                    auto [person, ph] = uf.canonical_with_hash_prehashed(pend[k].user, pend[k].uhash);
+                    pend[k].person = person;
+                    pend[k].ph = ph;
+                    uint32_t ps = static_cast<uint32_t>(ph & SHARD_MASK);
+                    pend[k].ps = ps;
+                    const auto& pm = pshards[ps].people;
+                    if (!pm.slots.empty()) __builtin_prefetch(&pm.slots[ph & pm.mask], 0, 1);
+                }
+                for (size_t k = 0; k < n_pend; ++k) {
+                    uint32_t pid = pshards[pend[k].ps].people.find(pend[k].person, pend[k].ph);
+                    if (pid == UINT32_MAX) continue;
+                    Hash128 h = hash128(pend[k].cid);
+                    my_b[h.lo & SHARD_MASK].push_back({h, pend[k].cid, pend[k].ts, pend[k].ps, pid, pend[k].camp_id});
+                }
+                n_pend = 0;
+            };
+
             while (true) {
                 size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= ck_chunks.size()) break;
                 const char* cur = ck_chunks[idx].begin;
                 const char* end = ck_chunks[idx].end;
                 while (cur < end) {
-                    if (!next_csv_line(cur, end, 4, c) || c[0].empty() || c[1].empty()) continue;
+                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
+                    size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
+                    std::string_view ln(cur, len);
+                    cur = nl ? nl + 1 : end;
+
+                    if (!parse_csv(ln, 4, c) || c[0].empty() || c[1].empty()) continue;
                     uint32_t camp_id = camp_ids.find(c[2]);
                     if (camp_id == UINT32_MAX) continue;
                     int64_t ts = 0;
-                    if (!parse_ts(c[3], ts) || ts < click_win_start || ts >= win_end) continue;
+                    if (!parse_ts(c[3], ts, dc) || ts < click_win_start || ts >= win_end) continue;
 
-                    auto [person, ph] = uf.canonical_with_hash(c[1]);
-                    uint32_t ps = static_cast<uint32_t>(ph & SHARD_MASK);
-                    uint32_t pid = pshards[ps].people.find(person, ph);
-                    if (pid == UINT32_MAX) continue;
-
-                    Hash128 h = hash128(c[0]);
-                    my_b[h.lo & SHARD_MASK].push_back({h, c[0], ts, ps, pid, camp_id});
+                    pend[n_pend++] = {c[0], c[1], {}, hash64(c[1]), 0, ts, camp_id, 0};
+                    if (n_pend == B) flush_pending();
                 }
             }
+            flush_pending();
         };
         std::vector<std::thread> ts;
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
+    lap("5a_ck_parse");
 
     std::vector<std::vector<std::vector<PersonClickMsg>>> pck_buckets(
         n_workers, std::vector<std::vector<PersonClickMsg>>(N_SHARDS));
@@ -932,6 +1062,7 @@ int main(int argc, char** argv) {
         for (auto& t : ts) t.join();
     }
     ck_buckets.clear();
+    lap("5b_ck_dedup");
 
     fs::create_directories(output_dir / "user_daily");
     fs::create_directories(output_dir / "campaign_daily");
@@ -1062,7 +1193,7 @@ int main(int argc, char** argv) {
                     if (L == R) {
                         for (uint32_t cid : active_list) active_cnt[cid] = 0;
                         active_list.clear();
-                        auto& ca = cmap[pack(UINT32_MAX)];
+                        auto& ca = cmap[pack(ORGANIC_CID)];
                         ca.sessions += 1; ca.purchasing += has_purch; ca.rev += s_rev;
                     } else {
                         size_t best = R - 1;
@@ -1135,6 +1266,7 @@ int main(int argc, char** argv) {
         write_parquet_table(output_dir / "user_daily" / "part-0.parquet",
                             arrow::Table::Make(user_schema, {a_uid, a_day, a_sess, a_evs, a_rev, a_cat}));
     }
+    lap("6_agg_user_parquet");
 
     {
         FlatCampMap camp_daily;
@@ -1154,7 +1286,7 @@ int main(int argc, char** argv) {
         for (const auto& s : camp_daily.slots) {
             if (s.key == UINT64_MAX) continue;
             uint32_t cid = static_cast<uint32_t>(s.key >> 32);
-            if (cid == UINT32_MAX) { cid_bytes += 7; ch_bytes += 7; }
+            if (cid == ORGANIC_CID) { cid_bytes += 7; ch_bytes += 7; }
             else { cid_bytes += camp_ids.id_slices[cid].second; ch_bytes += camp_channels[cid].size(); }
         }
 
@@ -1171,7 +1303,7 @@ int main(int argc, char** argv) {
             if (s.key == UINT64_MAX) continue;
             uint32_t cid = static_cast<uint32_t>(s.key >> 32);
             int32_t day = static_cast<int32_t>(static_cast<uint32_t>(s.key));
-            bool org = (cid == UINT32_MAX);
+            bool org = (cid == ORGANIC_CID);
             b_cid.UnsafeAppend(org ? std::string_view("organic") : camp_ids.view(cid));
             b_ch.UnsafeAppend(org ? std::string_view("organic") : std::string_view(camp_channels[cid]));
             b_day.UnsafeAppend(day);
@@ -1197,6 +1329,7 @@ int main(int argc, char** argv) {
         write_parquet_table(output_dir / "campaign_daily" / "part-0.parquet",
                             arrow::Table::Make(schema, {a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast}));
     }
+    lap("7_camp_parquet");
 
     std::fflush(nullptr);
     ::_exit(0);
