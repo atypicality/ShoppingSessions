@@ -1,23 +1,21 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+# Stage 1: Compile C++ binary for linux/amd64
+FROM gcc:13-bookworm AS builder
+WORKDIR /build
+COPY cpp/main.cpp .
+RUN g++ -O3 -std=c++20 -pthread -static-libstdc++ -static-libgcc -o pipeline main.cpp
+
+# Stage 2: Runtime image
 FROM python:3.12-slim-bookworm
+RUN useradd --uid 1000 --no-create-home --home-dir /scratch runner
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
+WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
+COPY --from=builder /build/pipeline /app/cpp/pipeline
 COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
+RUN chmod +x /app/run.sh /app/cpp/pipeline
 
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
+USER 1000
 CMD ["/app/run.sh"]
