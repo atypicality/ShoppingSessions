@@ -1,21 +1,28 @@
-# Stage 1: Compile C++ binary for linux/amd64
-FROM gcc:13-bookworm AS builder
+FROM debian:bookworm-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg g++ \
+    && curl -sSL https://apache.jfrog.io/artifactory/arrow/debian/apache-arrow-apt-source-latest-bookworm.deb -o arrow.deb \
+    && apt-get install -y ./arrow.deb \
+    && apt-get update && apt-get install -y --no-install-recommends libparquet-dev \
+    && rm -rf /var/lib/apt/lists/* arrow.deb
+
 WORKDIR /build
 COPY cpp/main.cpp .
-RUN g++ -O3 -std=c++20 -pthread -static-libstdc++ -static-libgcc -o pipeline main.cpp
+RUN g++ -O3 -march=x86-64-v3 -flto -s -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow
 
-# Stage 2: Runtime image
-FROM python:3.12-slim-bookworm
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch runner
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -sSL https://apache.jfrog.io/artifactory/arrow/debian/apache-arrow-apt-source-latest-bookworm.deb -o arrow.deb \
+    && apt-get install -y ./arrow.deb \
+    && apt-get update && apt-get install -y --no-install-recommends libparquet-dev \
+    && apt-get purge -y curl gnupg && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* arrow.deb \
+    && useradd --uid 1000 --no-create-home --home-dir /scratch runner
 
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY --from=builder /build/pipeline /app/cpp/pipeline
+COPY --from=builder /build/pipeline /app/pipeline
 COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh /app/cpp/pipeline
+RUN chmod +x /app/run.sh /app/pipeline
 
 USER 1000
 CMD ["/app/run.sh"]

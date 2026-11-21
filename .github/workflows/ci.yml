@@ -24,13 +24,8 @@ jobs:
       - name: Compile Python files
         run: python -m compileall -q pipeline scripts
 
-      - name: Compile C++ with warnings
-        run: |
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/src" \
-            -w /src \
-            gcc:13-bookworm \
-            g++ -std=c++20 -O3 -Wall -Wextra -Wpedantic -fsyntax-only cpp/main.cpp
+      - name: Compile C++ builder stage
+        run: docker buildx build --platform linux/amd64 --target builder .
 
   test:
     name: Build and fixture tests
