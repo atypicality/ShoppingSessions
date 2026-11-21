@@ -26,6 +26,7 @@ namespace fs = std::filesystem;
 constexpr int64_t MS_PER_SEC = 1000LL, MS_PER_MIN = 60LL * MS_PER_SEC,
                   MS_PER_HOUR = 60LL * MS_PER_MIN, MS_PER_DAY = 24LL * MS_PER_HOUR,
                   SESSION_GAP_MS = 30LL * MS_PER_MIN, SEVEN_DAYS_MS = 7LL * MS_PER_DAY;
+// Benchmark-verified default: 64 shards and 8 threads (NCPU=8).
 constexpr size_t N_SHARDS = 64;
 constexpr size_t SHARD_MASK = N_SHARDS - 1;
 constexpr size_t CHUNK_BYTES = 4 << 20;
@@ -257,8 +258,11 @@ std::vector<ByteChunk> make_chunks(const std::vector<MMapFile>& files) {
         if (!nl || nl + 1 >= f_end) continue;
         const char* cur = nl + 1;
         while (cur < f_end) {
+            if (static_cast<size_t>(f_end - cur) <= CHUNK_BYTES) {
+                chunks.push_back({cur, f_end});
+                break;
+            }
             const char* target = cur + CHUNK_BYTES;
-            if (target >= f_end) { chunks.push_back({cur, f_end}); break; }
             const char* next_nl = static_cast<const char*>(std::memchr(target, '\n', static_cast<size_t>(f_end - target)));
             if (!next_nl) { chunks.push_back({cur, f_end}); break; }
             chunks.push_back({cur, next_nl + 1});
@@ -480,6 +484,13 @@ struct PersonClickMsg {
     ValidClick ck;
 };
 
+// Use a more compact open-addressing table than 50% default occupancy.
+// Change SHOPPING_DEDUP_LOAD and A/B benchmark if different input distributions favor it.
+#ifndef SHOPPING_DEDUP_LOAD
+#define SHOPPING_DEDUP_LOAD 70
+#endif
+static_assert(SHOPPING_DEDUP_LOAD >= 40 && SHOPPING_DEDUP_LOAD <= 80);
+
 struct FlatEventMap {
     struct Slot {
         uint64_t h_lo;
@@ -493,7 +504,7 @@ struct FlatEventMap {
 
     void reset(size_t expected) {
         size_t cap = 1024;
-        while (cap < expected * 2) cap <<= 1;
+        while (cap * SHOPPING_DEDUP_LOAD < expected * 100) cap <<= 1;
         if (slots.size() < cap) {
             slots.assign(cap, Slot{0, 0, 0});
             gen = 1;
@@ -716,6 +727,10 @@ int main(int argc, char** argv) {
     });
 
     UnionFind uf;
+    // Main optimization: build identity links concurrently with event ingestion.
+    // Event parsing needs the products table but does not read UnionFind.
+    // Joining t_links before dedup establishes safe read-after-write synchronization.
+    std::thread t_links([&]() {
     {
         auto link_files = list_csvs(data_dir / "links");
         size_t lbytes = 0;
@@ -760,9 +775,9 @@ int main(int argc, char** argv) {
         }
     }
     uf.freeze();
-    t_prod.join();
-    t_camp.join();
-    lap("1-3_meta_links");
+    });
+    t_prod.join(); // needed for category lookups during event parsing
+    lap("1_products_ready_links_parallel");
 
     std::vector<MMapFile> event_mmaps;
     size_t total_ev_bytes = 0;
@@ -827,7 +842,10 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
-    lap("4a_ev_parse");
+    lap("4a_ev_parse_overlap_links");
+    t_links.join();
+    t_camp.join();
+    lap("3_links_campaigns_join");
 
     std::vector<std::vector<std::vector<PersonEventMsg>>> pev_buckets(
         n_workers, std::vector<std::vector<PersonEventMsg>>(N_SHARDS));
