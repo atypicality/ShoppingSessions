@@ -14,6 +14,23 @@
 
 namespace fs = std::filesystem;
 
+constexpr size_t IO_BUFFER_SIZE = 1 << 20;
+
+void configure_io(std::ios& stream) {
+    static char buffer[IO_BUFFER_SIZE];
+    stream.rdbuf()->pubsetbuf(buffer, IO_BUFFER_SIZE);
+}
+
+size_t estimate_rows(const std::vector<fs::path>& files, size_t average_bytes) {
+    size_t bytes = 0;
+    for (const auto& path : files) {
+        std::error_code error;
+        bytes += static_cast<size_t>(fs::file_size(path, error));
+    }
+    return bytes / average_bytes;
+}
+
+
 constexpr int64_t MS_PER_SEC  = 1000LL;
 constexpr int64_t MS_PER_MIN  = 60LL * MS_PER_SEC;
 constexpr int64_t MS_PER_HOUR = 60LL * MS_PER_MIN;
@@ -215,11 +232,25 @@ struct UnionFind {
 // Intern repeated dimensions once. Events and clicks can then refer to a
 // compact integer while the original spelling remains available for output.
 struct StringTable {
-    std::unordered_map<std::string, uint32_t> ids;
+    struct Hash {
+        using is_transparent = void;
+        size_t operator()(std::string_view value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+        size_t operator()(const std::string& value) const noexcept {
+            return operator()(std::string_view(value));
+        }
+    };
+    struct Equal {
+        using is_transparent = void;
+        bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+    };
+
+    std::unordered_map<std::string, uint32_t, Hash, Equal> ids;
     std::vector<std::string> values;
 
     uint32_t get(std::string value) {
-        auto it = ids.find(value);
+        auto it = ids.find(std::string_view(value));
         if (it != ids.end()) return it->second;
         uint32_t id = static_cast<uint32_t>(values.size());
         values.push_back(std::move(value));
@@ -310,7 +341,9 @@ int main(int argc, char** argv) {
     // 1. Load products.csv
     std::unordered_map<std::string, std::string> products;
     {
-        std::ifstream in(data_dir / "products.csv");
+        std::ifstream in;
+        configure_io(in);
+        in.open(data_dir / "products.csv");
         std::getline(in, line, '\n'); // skip header
         while (std::getline(in, line, '\n')) {
             if (parse_csv_line(line, 2, cols)) {
@@ -323,7 +356,9 @@ int main(int argc, char** argv) {
     StringTable campaign_ids;
     std::vector<std::string> campaign_channels;
     {
-        std::ifstream in(data_dir / "campaigns.csv");
+        std::ifstream in;
+        configure_io(in);
+        in.open(data_dir / "campaigns.csv");
         std::getline(in, line, '\n'); // skip header
         while (std::getline(in, line, '\n')) {
             if (parse_csv_line(line, 2, cols)) {
@@ -336,8 +371,12 @@ int main(int argc, char** argv) {
 
     // 3. Load links/*.csv -> Union-Find
     UnionFind uf;
-    for (const auto& path : list_csvs(data_dir / "links")) {
-        std::ifstream in(path);
+    const auto link_files = list_csvs(data_dir / "links");
+    uf.id_to_idx.reserve(estimate_rows(link_files, 40));
+    for (const auto& path : link_files) {
+        std::ifstream in;
+        configure_io(in);
+        in.open(path);
         std::getline(in, line, '\n'); // skip header
         while (std::getline(in, line, '\n')) {
             if (!parse_csv_line(line, 2, cols)) continue;
@@ -348,8 +387,13 @@ int main(int argc, char** argv) {
 
     // 4. Parse & Dedup events/*.csv (dedup BEFORE validation!)
     std::unordered_map<std::string, RawEvent> dedup_events;
-    for (const auto& path : list_csvs(data_dir / "events")) {
-        std::ifstream in(path);
+    const auto event_files = list_csvs(data_dir / "events");
+    dedup_events.reserve(estimate_rows(event_files, 100));
+    dedup_events.max_load_factor(0.80f);
+    for (const auto& path : event_files) {
+        std::ifstream in;
+        configure_io(in);
+        in.open(path);
         std::getline(in, line, '\n'); // skip header
         while (std::getline(in, line, '\n')) {
             if (!parse_csv_line(line, 7, cols)) continue;
@@ -409,8 +453,13 @@ int main(int argc, char** argv) {
     // 6. Parse, Dedup & Validate clicks/*.csv
     std::unordered_set<std::string> seen_clicks;
     std::vector<std::vector<ValidClick>> person_clicks;
-    for (const auto& path : list_csvs(data_dir / "clicks")) {
-        std::ifstream in(path);
+    const auto click_files = list_csvs(data_dir / "clicks");
+    seen_clicks.reserve(estimate_rows(click_files, 80));
+    seen_clicks.max_load_factor(0.80f);
+    for (const auto& path : click_files) {
+        std::ifstream in;
+        configure_io(in);
+        in.open(path);
         std::getline(in, line, '\n'); // skip header
         while (std::getline(in, line, '\n')) {
             if (!parse_csv_line(line, 4, cols)) continue;
@@ -419,7 +468,7 @@ int main(int argc, char** argv) {
             if (!seen_clicks.insert(cid).second) continue; // dedup
 
             if (cols[1].empty()) continue; // user_id empty
-            auto camp_it = campaign_ids.ids.find(std::string(cols[2]));
+            auto camp_it = campaign_ids.ids.find(cols[2]);
             if (camp_it == campaign_ids.ids.end()) continue;
             uint32_t campaign_id = camp_it->second;
 
@@ -560,7 +609,9 @@ int main(int argc, char** argv) {
 
     // 8. Write intermediate CSVs (quoting strings preserves leading/trailing spaces)
     {
-        std::ofstream out(user_out_path);
+        std::ofstream out;
+        configure_io(out);
+        out.open(user_out_path);
         out << "user_id,day,sessions,events,revenue_cents,top_category\n";
         for (const auto& [key, agg] : user_daily) {
             std::string top_cat;
@@ -580,7 +631,9 @@ int main(int argc, char** argv) {
     }
 
     {
-        std::ofstream out(campaign_out_path);
+        std::ofstream out;
+        configure_io(out);
+        out.open(campaign_out_path);
         out << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
         for (const auto& [key, agg] : campaign_daily) {
             const bool organic = key.first == UINT32_MAX;
