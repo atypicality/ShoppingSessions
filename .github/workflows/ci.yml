@@ -57,10 +57,11 @@ jobs:
             .
 
       - name: Run all fixtures
+        if: ${{ hashFiles('fixtures/**') != '' }}
         env:
           IMAGE: shopping-sessions:ci
-          CPUS: "8"
-          MEM: 24g
+          CPUS: "4"
+          MEM: 8g
           PLATFORM: linux/amd64
         run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
 
@@ -72,7 +73,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Scan source and configuration
-      - uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
