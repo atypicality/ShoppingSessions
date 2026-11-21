@@ -3,7 +3,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -171,7 +170,6 @@ bool parse_price(std::string_view s, int64_t& out_price) {
 
 struct UnionFind {
     std::unordered_map<std::string, uint32_t> id_to_idx;
-    std::vector<std::string> idx_to_id;
     std::vector<uint32_t> parent;
     std::vector<std::string> min_id;
 
@@ -180,7 +178,6 @@ struct UnionFind {
         if (it != id_to_idx.end()) return it->second;
         uint32_t idx = static_cast<uint32_t>(parent.size());
         id_to_idx.emplace(id, idx);
-        idx_to_id.push_back(id);
         parent.push_back(idx);
         min_id.push_back(id);
         return idx;
@@ -434,7 +431,6 @@ int main(int argc, char** argv) {
             int64_t session_start = evs[i].ts;
             std::string day = epoch_ms_to_date(session_start);
 
-            int64_t sess_events = 0;
             int64_t sess_rev = 0;
             bool has_purchase = false;
             auto& u_agg = user_daily[{person, day}];
@@ -444,7 +440,6 @@ int main(int argc, char** argv) {
             int64_t prev_ts = session_start;
             while (i < evs.size() && (evs[i].ts - prev_ts <= SESSION_GAP_MS)) {
                 prev_ts = evs[i].ts;
-                sess_events += 1;
                 u_agg.events += 1;
                 if (evs[i].is_purchase) {
                     has_purchase = true;
