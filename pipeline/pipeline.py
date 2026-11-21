@@ -7,23 +7,19 @@ import duckdb
 
 # the main idea here is to be able to take special parameters for testing
 # this now supports CLI arguments (for local testing) and environment variables (for Docker):
-def copy_csv_to_parquet(source: Path, destination: Path, columns: str, select_list: str) -> None:
-    con = duckdb.connect()
-    try:
-        con.execute(f"""
-            COPY (
-                SELECT {select_list}
-                FROM read_csv(
-                    '{source.as_posix()}',
-                    header=true,
-                    delim=',',
-                    quote='"',
-                    columns={{{columns}}}
-                )
-            ) TO '{destination.as_posix()}' (FORMAT PARQUET);
-        """)
-    finally:
-        con.close()
+def copy_csv_to_parquet(con: duckdb.DuckDBPyConnection, source: Path, destination: Path, columns: str, select_list: str) -> None:
+    con.execute(f"""
+        COPY (
+            SELECT {select_list}
+            FROM read_csv(
+                '{source.as_posix()}',
+                header=true,
+                delim=',',
+                quote='"',
+                columns={{{columns}}}
+            )
+        ) TO '{destination.as_posix()}' (FORMAT PARQUET);
+    """)
 
 
 def main() -> None:
@@ -64,16 +60,20 @@ def main() -> None:
     user_out.mkdir(parents=True, exist_ok=True)
     campaign_out.mkdir(parents=True, exist_ok=True)
 
-    copy_csv_to_parquet(
-        user_csv, user_out / "part-0.parquet",
-        "'user_id': 'VARCHAR', 'day': 'VARCHAR', 'sessions': 'BIGINT', 'events': 'BIGINT', 'revenue_cents': 'BIGINT', 'top_category': 'VARCHAR'",
-        "user_id::VARCHAR AS user_id, day::DATE AS day, sessions::BIGINT AS sessions, events::BIGINT AS events, revenue_cents::BIGINT AS revenue_cents, CASE WHEN top_category = '' THEN NULL ELSE top_category END::VARCHAR AS top_category",
-    )
-    copy_csv_to_parquet(
-        campaign_csv, campaign_out / "part-0.parquet",
-        "'campaign_id': 'VARCHAR', 'channel': 'VARCHAR', 'day': 'VARCHAR', 'sessions': 'BIGINT', 'purchasing_sessions': 'BIGINT', 'revenue_cents': 'BIGINT', 'assisted_sessions': 'BIGINT'",
-        "campaign_id::VARCHAR AS campaign_id, channel::VARCHAR AS channel, day::DATE AS day, sessions::BIGINT AS sessions, purchasing_sessions::BIGINT AS purchasing_sessions, revenue_cents::BIGINT AS revenue_cents, assisted_sessions::BIGINT AS assisted_sessions",
-    )
+    con = duckdb.connect()
+    try:
+        copy_csv_to_parquet(
+            con, user_csv, user_out / "part-0.parquet",
+            "'user_id': 'VARCHAR', 'day': 'DATE', 'sessions': 'BIGINT', 'events': 'BIGINT', 'revenue_cents': 'BIGINT', 'top_category': 'VARCHAR'",
+            """user_id, day, sessions, events, revenue_cents, CASE WHEN top_category = '' THEN NULL ELSE top_category END AS top_category""",
+        )
+        copy_csv_to_parquet(
+            con, campaign_csv, campaign_out / "part-0.parquet",
+            "'campaign_id': 'VARCHAR', 'channel': 'VARCHAR', 'day': 'DATE', 'sessions': 'BIGINT', 'purchasing_sessions': 'BIGINT', 'revenue_cents': 'BIGINT', 'assisted_sessions': 'BIGINT'",
+            """campaign_id, channel, day, sessions, purchasing_sessions, revenue_cents, assisted_sessions AS assisted_sessions""",
+        )
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
