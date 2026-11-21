@@ -2,7 +2,13 @@
 # Run the image the way the scorer does: docker_run.sh DATA_DIR OUTPUT_DIR
 # Same flags as the scorer box, except the resource limits come from CPUS / MEM.
 set -eu
-IMAGE="${IMAGE:-shopping-sessions:latest}"
+if [ -n "${IMAGE:-}" ]; then
+  IMAGE="$IMAGE"
+elif docker image inspect shopping-pipeline:latest >/dev/null 2>&1; then
+  IMAGE="shopping-pipeline:latest"
+else
+  IMAGE="shopping-sessions:latest"
+fi
 CPUS="${CPUS:-8}"
 MEM="${MEM:-24g}"
 PLATFORM="${PLATFORM:-linux/amd64}"

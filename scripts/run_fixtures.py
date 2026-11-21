@@ -9,6 +9,7 @@ Example: python run_fixtures.py ../fixtures -- python reference.py
 """
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,14 @@ def rows(df):
 def main():
     sep = sys.argv.index("--")
     fx_dir, cmd = sys.argv[1], sys.argv[sep + 1:]
+    timeout = float(os.environ.get("FIXTURE_TIMEOUT_SECONDS", "120"))
+    # Windows cannot execute a .sh file directly. Also, backslashes in paths
+    # are escape characters when passed through Git Bash.
+    if os.name == "nt" and cmd and cmd[0].lower().endswith(".sh"):
+        if shutil.which("bash") is None:
+            sys.exit("bash is required to run shell fixture commands on Windows")
+        cmd = ["bash", *cmd]
+
     failed = []
     cases = sorted(d for d in os.listdir(fx_dir) if os.path.isdir(os.path.join(fx_dir, d)))
     if not cases:
@@ -70,9 +79,25 @@ def main():
         data = os.path.join(fx_dir, case, "data")
         if not os.path.isdir(data):
             data = os.path.join(fx_dir, case, "input")
+        run_data = data.replace("\\", "/") if os.name == "nt" and "bash" in Path(cmd[0]).name.lower() else data
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as out:
-            env = dict(os.environ, DATA_DIR=data, OUTPUT_DIR=out)
-            p = subprocess.run(cmd + [data, out], env=env, capture_output=True, text=True)
+            run_out = out.replace("\\", "/") if os.name == "nt" and "bash" in Path(cmd[0]).name.lower() else out
+            env = dict(os.environ, DATA_DIR=run_data, OUTPUT_DIR=run_out)
+            print(f"running {case}", flush=True)
+            try:
+                p = subprocess.run(
+                    cmd + [run_data, run_out],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                failed.append(case)
+                print(f"FAIL {case}: timed out after {timeout:g}s")
+                if error.stderr:
+                    print(error.stderr[-2000:])
+                continue
             if p.returncode != 0:
                 failed.append(case)
                 print(f"FAIL {case}: exit {p.returncode}\n{p.stderr[-2000:]}")
