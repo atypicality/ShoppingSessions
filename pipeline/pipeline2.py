@@ -5,10 +5,16 @@ import sys
 from pathlib import Path
 import duckdb
 
-
+# the main idea here is to be able to take special parameters for testing
+# this now supports CLI arguments (for local testing) and environment variables (for Docker):
 def main() -> None:
-    data_dir = Path(os.environ.get("DATA_DIR", "/data"))
-    output_dir = Path(os.environ.get("OUTPUT_DIR", "/output"))
+    if len(sys.argv) >= 3:
+        data_dir = Path(sys.argv[1])
+        output_dir = Path(sys.argv[2])
+    else:
+        data_dir = Path(os.environ.get("DATA_DIR", "/data"))
+        output_dir = Path(os.environ.get("OUTPUT_DIR", "/output"))
+
     scratch_dir = Path(os.environ.get("SCRATCH_DIR", "/tmp/scratch"))
     scratch_dir.mkdir(parents=True, exist_ok=True)
 

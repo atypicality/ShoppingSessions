@@ -1,5 +1,12 @@
-fixtures/
-dev/
+.git/
+.venv/
+__pycache__/
+*.py[cod]
 out/
-*.md
-.git
+dev/
+dev-*/
+dev-answer/
+scratch/
+fixtures/
+*.duckdb
+*.log
