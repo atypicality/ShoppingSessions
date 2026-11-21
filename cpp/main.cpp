@@ -1,11 +1,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -13,11 +13,18 @@
 #include <unordered_set>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <parquet/arrow/writer.h>
+
 namespace fs = std::filesystem;
 
 constexpr int64_t MS_PER_SEC = 1000LL, MS_PER_MIN = 60LL * MS_PER_SEC,
                   MS_PER_HOUR = 60LL * MS_PER_MIN, MS_PER_DAY = 24LL * MS_PER_HOUR,
                   SESSION_GAP_MS = 30LL * MS_PER_MIN, SEVEN_DAYS_MS = 7LL * MS_PER_DAY;
+constexpr size_t N_SHARDS = 64;
+constexpr size_t SHARD_MASK = N_SHARDS - 1;
+constexpr size_t BATCH_LIMIT = 2048;
 
 inline bool is_digit(char c) { return c >= '0' && c <= '9'; }
 
@@ -29,7 +36,6 @@ struct SVEqual {
     using is_transparent = void;
     bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
 };
-
 template <typename V>
 using SVMap = std::unordered_map<std::string, V, SVHash, SVEqual>;
 
@@ -56,22 +62,6 @@ int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
     unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
     unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097 + static_cast<int64_t>(doe) - 719468;
-}
-
-std::string day_to_date(int32_t day) {
-    int64_t z = static_cast<int64_t>(day) + 719468;
-    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    unsigned doe = static_cast<unsigned>(z - era * 146097);
-    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = static_cast<int64_t>(yoe) + era * 400;
-    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    unsigned mp = (5 * doy + 2) / 153;
-    unsigned d = doy - (153 * mp + 2) / 5 + 1;
-    unsigned m = mp + (mp < 10 ? 3 : -9);
-    y += (m <= 2);
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%04lld-%02u-%02u", static_cast<long long>(y), m, d);
-    return buf;
 }
 
 bool parse_2d(std::string_view s, size_t p, int& out) {
@@ -130,6 +120,15 @@ bool parse_price(std::string_view s, int32_t& out) {
     return true;
 }
 
+std::string extract_json_str(const std::string& json, std::string_view key) {
+    size_t kpos = json.find(key);
+    if (kpos == std::string::npos) return "";
+    size_t colon = json.find(':', kpos + key.size());
+    size_t q1 = json.find('"', colon + 1);
+    size_t q2 = json.find('"', q1 + 1);
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
 struct StringTable {
     SVMap<uint32_t> ids;
     std::vector<std::string> values;
@@ -169,17 +168,19 @@ struct UnionFind {
         parent[rb] = ra;
         if (min_id[rb] < min_id[ra]) min_id[ra] = min_id[rb];
     }
-    std::string_view canonical(std::string_view sv) {
+    void freeze() {
+        for (uint32_t i = 0; i < parent.size(); ++i) parent[i] = find(i);
+    }
+    std::string_view canonical(std::string_view sv) const {
         auto it = id_to_idx.find(sv);
-        return (it == id_to_idx.end()) ? sv : std::string_view(min_id[find(it->second)]);
+        return (it == id_to_idx.end()) ? sv : std::string_view(min_id[parent[it->second]]);
     }
 };
 
-// 32 bytes, zero heap allocations per event
 struct DedupEvent {
     int64_t ingest_ts;
     int64_t ts;
-    uint32_t person_id;
+    std::string person; // fits in SSO for typical IDs
     uint32_t category_id;
     int32_t price_cents;
     uint8_t flags; // bit 0: valid, bit 1: is_purchase
@@ -198,29 +199,64 @@ struct ValidClick {
     uint32_t campaign_id;
 };
 
+struct PersonShard {
+    std::mutex mu;
+    StringTable people;
+    std::vector<std::vector<ValidEvent>> events;
+    std::vector<std::vector<ValidClick>> clicks;
+};
+
+struct UserRow {
+    uint32_t shard;
+    uint32_t pid;
+    int32_t day;
+    int64_t sessions;
+    int64_t events;
+    int64_t revenue_cents;
+    uint32_t top_cat; // UINT32_MAX => null
+};
+
 struct CampAgg { int64_t sessions = 0, purchasing = 0, rev = 0, assisted = 0; };
 
-std::vector<fs::path> list_csvs(const fs::path& dir) {
-    std::vector<fs::path> files;
-    if (fs::exists(dir))
-        for (const auto& e : fs::directory_iterator(dir))
-            if (e.is_regular_file() && e.path().extension() == ".csv") files.push_back(e.path());
-    return files;
+std::vector<fs::path> list_csvs_sorted(const fs::path& dir) {
+    std::vector<std::pair<uint64_t, fs::path>> sized;
+    std::error_code ec;
+    if (fs::exists(dir)) {
+        for (const auto& e : fs::directory_iterator(dir)) {
+            if (e.is_regular_file() && e.path().extension() == ".csv")
+                sized.emplace_back(fs::file_size(e.path(), ec), e.path());
+        }
+    }
+    std::sort(sized.begin(), sized.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<fs::path> out;
+    out.reserve(sized.size());
+    for (auto& [sz, p] : sized) out.push_back(std::move(p));
+    return out;
 }
 
-size_t est_rows(const std::vector<fs::path>& files, size_t avg) {
-    size_t b = 0;
-    std::error_code ec;
-    for (const auto& p : files) b += static_cast<size_t>(fs::file_size(p, ec));
-    return b / avg + 16;
+void write_parquet_table(const fs::path& path, const std::shared_ptr<arrow::Table>& table) {
+    auto out_res = arrow::io::FileOutputStream::Open(path.string());
+    if (!out_res.ok()) { std::cerr << out_res.status().ToString() << "\n"; std::exit(1); }
+    auto st = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out_res, 1 << 20);
+    if (!st.ok()) { std::cerr << st.ToString() << "\n"; std::exit(1); }
 }
 
 int main(int argc, char** argv) {
-    if (argc < 6) return 1;
-    fs::path data_dir = argv[1];
+    fs::path data_dir = (argc >= 3) ? fs::path(argv[1]) : fs::path(std::getenv("DATA_DIR") ? std::getenv("DATA_DIR") : "/data");
+    fs::path output_dir = (argc >= 3) ? fs::path(argv[2]) : fs::path(std::getenv("OUTPUT_DIR") ? std::getenv("OUTPUT_DIR") : "/output");
+
+    unsigned n_workers = std::thread::hardware_concurrency();
+    if (const char* env = std::getenv("NCPU")) if (auto v = std::atoi(env); v > 0) n_workers = v;
+    n_workers = std::max(1u, n_workers);
+
+    // 0. Read manifest.json
     int64_t win_start = 0, win_end = 0;
-    parse_ts(argv[2], win_start);
-    parse_ts(argv[3], win_end);
+    {
+        std::ifstream mf(data_dir / "manifest.json");
+        std::string content((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+        parse_ts(extract_json_str(content, "\"window_start\""), win_start);
+        parse_ts(extract_json_str(content, "\"window_end\""), win_end);
+    }
     int64_t click_win_start = win_start - SEVEN_DAYS_MS;
 
     std::vector<char> io_buf(1 << 20);
@@ -255,229 +291,367 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 3. Links -> Union-Find
+    // 3. Links -> Union-Find (frozen for lock-free reads)
     UnionFind uf;
-    auto link_files = list_csvs(data_dir / "links");
-    uf.id_to_idx.reserve(est_rows(link_files, 32));
-    for (const auto& path : link_files) {
+    for (const auto& path : list_csvs_sorted(data_dir / "links")) {
         std::ifstream in(path);
         in.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
         std::getline(in, line, '\n');
         while (std::getline(in, line, '\n'))
             if (parse_csv(line, 2, cols) && !cols[0].empty() && !cols[1].empty()) uf.unite(cols[0], cols[1]);
     }
+    uf.freeze();
 
-    // 4. Events: Dedup + Eager Validation into compact 32-byte struct
-    StringTable people;
-    auto event_files = list_csvs(data_dir / "events");
-    SVMap<DedupEvent> dedup;
-    dedup.max_load_factor(0.75f);
-    dedup.reserve(est_rows(event_files, 90));
+    // 4. Parallel Events Parse + Sharded Dedup
+    auto event_files = list_csvs_sorted(data_dir / "events");
+    std::vector<std::mutex> ev_mu(N_SHARDS);
+    std::vector<SVMap<DedupEvent>> ev_shards(N_SHARDS);
+    for (auto& m : ev_shards) m.max_load_factor(0.75f);
 
-    for (const auto& path : event_files) {
-        std::ifstream in(path);
-        in.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
-        std::getline(in, line, '\n');
-        while (std::getline(in, line, '\n')) {
-            if (!parse_csv(line, 7, cols) || cols[0].empty()) continue;
-            int64_t ingest_ts = 0;
-            if (!parse_ts(cols[3], ingest_ts)) continue;
+    {
+        std::atomic<size_t> next_file{0};
+        auto worker = [&]() {
+            std::vector<char> buf(1 << 20);
+            std::vector<std::string_view> c;
+            std::string ln;
+            std::vector<std::vector<std::pair<std::string, DedupEvent>>> batches(N_SHARDS);
 
-            auto it = dedup.find(cols[0]);
-            if (it != dedup.end() && ingest_ts >= it->second.ingest_ts) continue;
+            auto flush_shard = [&](size_t s) {
+                if (batches[s].empty()) return;
+                std::lock_guard<std::mutex> lk(ev_mu[s]);
+                auto& map = ev_shards[s];
+                for (auto& [eid, ev] : batches[s]) {
+                    auto it = map.find(eid);
+                    if (it == map.end()) map.emplace(std::move(eid), std::move(ev));
+                    else if (ev.ingest_ts < it->second.ingest_ts) it->second = std::move(ev);
+                }
+                batches[s].clear();
+            };
 
-            DedupEvent ev{ingest_ts, 0, 0, 0, 0, 0};
-            int64_t ts = 0;
-            if (!cols[1].empty() && !cols[5].empty() && parse_ts(cols[2], ts) &&
-                ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
-                bool ok = true, is_purch = false;
-                int32_t price = 0;
-                if (cols[4] == "purchase") { is_purch = true; ok = parse_price(cols[6], price); }
-                else if (cols[4] != "view" && cols[4] != "cart") ok = false;
+            while (true) {
+                size_t idx = next_file.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= event_files.size()) break;
+                std::ifstream in(event_files[idx]);
+                in.rdbuf()->pubsetbuf(buf.data(), buf.size());
+                std::getline(in, ln, '\n');
+                while (std::getline(in, ln, '\n')) {
+                    if (!parse_csv(ln, 7, c) || c[0].empty()) continue;
+                    int64_t ingest_ts = 0;
+                    if (!parse_ts(c[3], ingest_ts)) continue;
 
-                if (ok) {
-                    auto pit = products.find(cols[5]);
-                    ev.ts = ts;
-                    ev.person_id = people.get(uf.canonical(cols[1]));
-                    ev.category_id = (pit != products.end()) ? pit->second : unknown_cat;
-                    ev.price_cents = price;
-                    ev.flags = 1 | (is_purch ? 2 : 0);
+                    DedupEvent ev{ingest_ts, 0, "", 0, 0, 0};
+                    int64_t ts = 0;
+                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts) &&
+                        ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
+                        bool ok = true, is_purch = false;
+                        int32_t price = 0;
+                        if (c[4] == "purchase") { is_purch = true; ok = parse_price(c[6], price); }
+                        else if (c[4] != "view" && c[4] != "cart") ok = false;
+
+                        if (ok) {
+                            auto pit = products.find(c[5]);
+                            ev.ts = ts;
+                            ev.person = std::string(uf.canonical(c[1]));
+                            ev.category_id = (pit != products.end()) ? pit->second : unknown_cat;
+                            ev.price_cents = price;
+                            ev.flags = 1 | (is_purch ? 2 : 0);
+                        }
+                    }
+                    size_t s = SVHash{}(c[0]) & SHARD_MASK;
+                    batches[s].emplace_back(std::string(c[0]), std::move(ev));
+                    if (batches[s].size() >= BATCH_LIMIT) flush_shard(s);
                 }
             }
-            if (it == dedup.end()) dedup.emplace(std::string(cols[0]), ev);
-            else it->second = ev;
-        }
+            for (size_t s = 0; s < N_SHARDS; ++s) flush_shard(s);
+        };
+
+        std::vector<std::thread> ts;
+        for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker);
+        for (auto& t : ts) t.join();
     }
 
-    std::vector<std::vector<ValidEvent>> person_events(people.values.size());
-    for (const auto& [k, ev] : dedup) {
-        if (ev.flags & 1)
-            person_events[ev.person_id].push_back({ev.ts, ev.price_cents, ev.category_id, (ev.flags & 2) != 0});
+    // 4b. Route surviving events into 64 PersonShards in parallel
+    std::vector<PersonShard> pshards(N_SHARDS);
+    {
+        std::atomic<size_t> next_s{0};
+        auto worker = [&]() {
+            std::vector<std::vector<std::pair<std::string, ValidEvent>>> batches(N_SHARDS);
+            auto flush = [&](size_t ps) {
+                if (batches[ps].empty()) return;
+                std::lock_guard<std::mutex> lk(pshards[ps].mu);
+                auto& sh = pshards[ps];
+                for (auto& [person, ve] : batches[ps]) {
+                    uint32_t pid = sh.people.get(person);
+                    if (pid >= sh.events.size()) sh.events.resize(pid + 1);
+                    sh.events[pid].push_back(ve);
+                }
+                batches[ps].clear();
+            };
+
+            while (true) {
+                size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
+                if (s >= N_SHARDS) break;
+                for (auto& [eid, ev] : ev_shards[s]) {
+                    if (!(ev.flags & 1)) continue;
+                    size_t ps = SVHash{}(ev.person) & SHARD_MASK;
+                    batches[ps].emplace_back(std::move(ev.person),
+                                             ValidEvent{ev.ts, ev.price_cents, ev.category_id, (ev.flags & 2) != 0});
+                    if (batches[ps].size() >= BATCH_LIMIT) flush(ps);
+                }
+                ev_shards[s].clear();
+                ev_shards[s].rehash(0);
+            }
+            for (size_t ps = 0; ps < N_SHARDS; ++ps) flush(ps);
+        };
+        std::vector<std::thread> ts;
+        for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker);
+        for (auto& t : ts) t.join();
     }
-    dedup.clear();
-    dedup.rehash(0);
+    for (auto& sh : pshards) sh.clicks.resize(sh.events.size());
 
-    // 5. Clicks
-    auto click_files = list_csvs(data_dir / "clicks");
-    std::unordered_set<std::string, SVHash, SVEqual> seen_clicks;
-    seen_clicks.max_load_factor(0.75f);
-    seen_clicks.reserve(est_rows(click_files, 70));
-    std::vector<std::vector<ValidClick>> person_clicks(people.values.size());
+    // 5. Parallel Clicks Parse + Sharded Dedup -> Route to PersonShards
+    auto click_files = list_csvs_sorted(data_dir / "clicks");
+    std::vector<std::mutex> ck_mu(N_SHARDS);
+    std::vector<std::unordered_set<std::string, SVHash, SVEqual>> ck_seen(N_SHARDS);
+    for (auto& s : ck_seen) s.max_load_factor(0.75f);
 
-    for (const auto& path : click_files) {
-        std::ifstream in(path);
-        in.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
-        std::getline(in, line, '\n');
-        while (std::getline(in, line, '\n')) {
-            if (!parse_csv(line, 4, cols) || cols[0].empty()) continue;
-            if (seen_clicks.find(cols[0]) != seen_clicks.end()) continue;
-            seen_clicks.emplace(cols[0]);
-            if (cols[1].empty()) continue;
-            auto cit = camp_ids.ids.find(cols[2]);
-            if (cit == camp_ids.ids.end()) continue;
-            int64_t ts = 0;
-            if (!parse_ts(cols[3], ts) || ts < click_win_start || ts >= win_end) continue;
+    {
+        std::atomic<size_t> next_file{0};
+        auto worker = [&]() {
+            std::vector<char> buf(1 << 20);
+            std::vector<std::string_view> c;
+            std::string ln;
+            struct RawCk { std::string cid; std::string person; int64_t ts; uint32_t camp; };
+            std::vector<std::vector<RawCk>> batches(N_SHARDS);
 
-            auto pit = people.ids.find(uf.canonical(cols[1]));
-            if (pit == people.ids.end()) continue; // person has no valid events -> can't have sessions
-            person_clicks[pit->second].push_back({ts, std::string(cols[0]), cit->second});
-        }
+            auto flush_ck = [&](size_t s) {
+                if (batches[s].empty()) return;
+                std::vector<RawCk> unique_cks;
+                {
+                    std::lock_guard<std::mutex> lk(ck_mu[s]);
+                    auto& seen = ck_seen[s];
+                    for (auto& r : batches[s]) {
+                        if (seen.find(r.cid) == seen.end()) {
+                            seen.insert(r.cid);
+                            unique_cks.push_back(std::move(r));
+                        }
+                    }
+                }
+                batches[s].clear();
+                for (auto& r : unique_cks) {
+                    size_t ps = SVHash{}(r.person) & SHARD_MASK;
+                    auto& sh = pshards[ps];
+                    auto pit = sh.people.ids.find(r.person);
+                    if (pit == sh.people.ids.end()) continue; // no valid events for this person
+                    std::lock_guard<std::mutex> lk(sh.mu);
+                    sh.clicks[pit->second].push_back({r.ts, std::move(r.cid), r.camp});
+                }
+            };
+
+            while (true) {
+                size_t idx = next_file.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= click_files.size()) break;
+                std::ifstream in(click_files[idx]);
+                in.rdbuf()->pubsetbuf(buf.data(), buf.size());
+                std::getline(in, ln, '\n');
+                while (std::getline(in, ln, '\n')) {
+                    if (!parse_csv(ln, 4, c) || c[0].empty() || c[1].empty()) continue;
+                    auto cit = camp_ids.ids.find(c[2]);
+                    if (cit == camp_ids.ids.end()) continue;
+                    int64_t ts = 0;
+                    if (!parse_ts(c[3], ts) || ts < click_win_start || ts >= win_end) continue;
+                    size_t s = SVHash{}(c[0]) & SHARD_MASK;
+                    batches[s].push_back({std::string(c[0]), std::string(uf.canonical(c[1])), ts, cit->second});
+                    if (batches[s].size() >= BATCH_LIMIT) flush_ck(s);
+                }
+            }
+            for (size_t s = 0; s < N_SHARDS; ++s) flush_ck(s);
+        };
+        std::vector<std::thread> ts;
+        for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker);
+        for (auto& t : ts) t.join();
     }
-    seen_clicks.clear();
-    seen_clicks.rehash(0);
+    ck_seen.clear();
 
-    // 6. Parallel Sessionize, Attribute & Stream user_daily directly to buffers
-    unsigned n_workers = std::thread::hardware_concurrency();
-    if (const char* env = std::getenv("NCPU")) if (auto v = std::atoi(env); v > 0) n_workers = v;
-    n_workers = std::max(1u, std::min<unsigned>(n_workers, std::max<size_t>(1, person_events.size())));
-
-    std::atomic<size_t> next_person{0};
-    std::vector<std::string> user_bufs(n_workers);
+    // 6. Parallel Sessionize & Attribute across PersonShards
+    std::atomic<size_t> next_ps{0};
+    std::vector<std::vector<UserRow>> user_locals(n_workers);
     std::vector<std::unordered_map<uint64_t, CampAgg>> camp_locals(n_workers);
     const size_t num_cats = categories.values.size();
 
-    auto worker_fn = [&](unsigned tid) {
-        auto& ubuf = user_bufs[tid];
-        ubuf.reserve(1 << 20);
+    auto agg_worker = [&](unsigned tid) {
+        auto& urows = user_locals[tid];
         auto& cmap = camp_locals[tid];
         std::vector<int64_t> cat_rev(num_cats, 0);
         std::vector<uint32_t> touched_cats;
         std::unordered_map<uint32_t, uint32_t> active;
 
         while (true) {
-            size_t pid = next_person.fetch_add(1, std::memory_order_relaxed);
-            if (pid >= person_events.size()) break;
-            auto& evs = person_events[pid];
-            if (evs.empty()) continue;
+            size_t ps = next_ps.fetch_add(1, std::memory_order_relaxed);
+            if (ps >= N_SHARDS) break;
+            auto& sh = pshards[ps];
 
-            std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) { return a.ts < b.ts; });
-            auto& clicks = person_clicks[pid];
-            std::sort(clicks.begin(), clicks.end(), [](const ValidClick& a, const ValidClick& b) {
-                return a.ts != b.ts ? a.ts < b.ts : a.click_id < b.click_id;
-            });
+            for (uint32_t pid = 0; pid < sh.events.size(); ++pid) {
+                auto& evs = sh.events[pid];
+                if (evs.empty()) continue;
 
-            active.clear();
-            size_t L = 0, R = 0, i = 0;
-            int32_t cur_day = INT32_MIN;
-            int64_t d_sess = 0, d_evs = 0, d_rev = 0;
+                std::sort(evs.begin(), evs.end(), [](const ValidEvent& a, const ValidEvent& b) { return a.ts < b.ts; });
+                auto& clicks = sh.clicks[pid];
+                std::sort(clicks.begin(), clicks.end(), [](const ValidClick& a, const ValidClick& b) {
+                    return a.ts != b.ts ? a.ts < b.ts : a.click_id < b.click_id;
+                });
 
-            auto flush_day = [&]() {
-                if (d_sess == 0) return;
-                uint32_t best_cat = UINT32_MAX;
-                int64_t best_rev = -1;
-                for (uint32_t c : touched_cats) {
-                    int64_t r = cat_rev[c];
-                    if (r > best_rev || (r == best_rev && categories.values[c] < categories.values[best_cat])) {
-                        best_rev = r; best_cat = c;
+                active.clear();
+                size_t L = 0, R = 0, i = 0;
+                int32_t cur_day = INT32_MIN;
+                int64_t d_sess = 0, d_evs = 0, d_rev = 0;
+
+                auto flush_day = [&]() {
+                    if (d_sess == 0) return;
+                    uint32_t best_cat = UINT32_MAX;
+                    int64_t best_rev = -1;
+                    for (uint32_t c : touched_cats) {
+                        int64_t r = cat_rev[c];
+                        if (r > best_rev || (r == best_rev && categories.values[c] < categories.values[best_cat])) {
+                            best_rev = r; best_cat = c;
+                        }
+                        cat_rev[c] = 0;
                     }
-                    cat_rev[c] = 0;
-                }
-                touched_cats.clear();
-                ubuf.push_back('"'); ubuf.append(people.values[pid]); ubuf.append("\",");
-                ubuf.append(day_to_date(cur_day)); ubuf.push_back(',');
-                ubuf.append(std::to_string(d_sess)); ubuf.push_back(',');
-                ubuf.append(std::to_string(d_evs)); ubuf.push_back(',');
-                ubuf.append(std::to_string(d_rev)); ubuf.push_back(',');
-                if (best_cat != UINT32_MAX) { ubuf.push_back('"'); ubuf.append(categories.values[best_cat]); ubuf.push_back('"'); }
-                ubuf.push_back('\n');
-                d_sess = d_evs = d_rev = 0;
-            };
+                    touched_cats.clear();
+                    urows.push_back({static_cast<uint32_t>(ps), pid, cur_day, d_sess, d_evs, d_rev, best_cat});
+                    d_sess = d_evs = d_rev = 0;
+                };
 
-            while (i < evs.size()) {
-                int64_t s_start = evs[i].ts;
-                int32_t day = static_cast<int32_t>(s_start >= 0 ? s_start / MS_PER_DAY : (s_start - MS_PER_DAY + 1) / MS_PER_DAY);
-                if (day != cur_day) { flush_day(); cur_day = day; }
+                while (i < evs.size()) {
+                    int64_t s_start = evs[i].ts;
+                    int32_t day = static_cast<int32_t>(s_start >= 0 ? s_start / MS_PER_DAY : (s_start - MS_PER_DAY + 1) / MS_PER_DAY);
+                    if (day != cur_day) { flush_day(); cur_day = day; }
 
-                d_sess += 1;
-                int64_t s_rev = 0, prev_ts = s_start;
-                bool has_purch = false;
-                while (i < evs.size() && evs[i].ts - prev_ts <= SESSION_GAP_MS) {
-                    prev_ts = evs[i].ts;
-                    d_evs += 1;
-                    if (evs[i].is_purchase) {
-                        has_purch = true;
-                        s_rev += evs[i].price_cents;
-                        d_rev += evs[i].price_cents;
-                        uint32_t c = evs[i].category_id;
-                        if (cat_rev[c] == 0) touched_cats.push_back(c);
-                        cat_rev[c] += evs[i].price_cents;
+                    d_sess += 1;
+                    int64_t s_rev = 0, prev_ts = s_start;
+                    bool has_purch = false;
+                    while (i < evs.size() && evs[i].ts - prev_ts <= SESSION_GAP_MS) {
+                        prev_ts = evs[i].ts;
+                        d_evs += 1;
+                        if (evs[i].is_purchase) {
+                            has_purch = true;
+                            s_rev += evs[i].price_cents;
+                            d_rev += evs[i].price_cents;
+                            uint32_t c = evs[i].category_id;
+                            if (cat_rev[c] == 0) touched_cats.push_back(c);
+                            cat_rev[c] += evs[i].price_cents;
+                        }
+                        ++i;
                     }
-                    ++i;
-                }
 
-                while (R < clicks.size() && clicks[R].ts <= s_start) { ++active[clicks[R].campaign_id]; ++R; }
-                while (L < R && clicks[L].ts < s_start - SEVEN_DAYS_MS) {
-                    if (--active[clicks[L].campaign_id] == 0) active.erase(clicks[L].campaign_id);
-                    ++L;
-                }
+                    while (R < clicks.size() && clicks[R].ts <= s_start) { ++active[clicks[R].campaign_id]; ++R; }
+                    while (L < R && clicks[L].ts < s_start - SEVEN_DAYS_MS) {
+                        if (--active[clicks[L].campaign_id] == 0) active.erase(clicks[L].campaign_id);
+                        ++L;
+                    }
 
-                auto pack = [&](uint32_t cid) { return (static_cast<uint64_t>(cid) << 32) | static_cast<uint32_t>(day); };
-                if (L == R) {
-                    auto& ca = cmap[pack(UINT32_MAX)];
-                    ca.sessions += 1; ca.purchasing += has_purch; ca.rev += s_rev;
-                } else {
-                    size_t best = R - 1;
-                    while (best > L && clicks[best - 1].ts == clicks[R - 1].ts) --best;
-                    auto& ca = cmap[pack(clicks[best].campaign_id)];
-                    ca.sessions += 1; ca.purchasing += has_purch; ca.rev += s_rev;
-                    for (const auto& [cid, cnt] : active) cmap[pack(cid)].assisted += 1;
+                    auto pack = [&](uint32_t cid) { return (static_cast<uint64_t>(cid) << 32) | static_cast<uint32_t>(day); };
+                    if (L == R) {
+                        auto& ca = cmap[pack(UINT32_MAX)];
+                        ca.sessions += 1; ca.purchasing += has_purch; ca.rev += s_rev;
+                    } else {
+                        size_t best = R - 1;
+                        while (best > L && clicks[best - 1].ts == clicks[R - 1].ts) --best;
+                        auto& ca = cmap[pack(clicks[best].campaign_id)];
+                        ca.sessions += 1; ca.purchasing += has_purch; ca.rev += s_rev;
+                        for (const auto& [cid, cnt] : active) cmap[pack(cid)].assisted += 1;
+                    }
                 }
+                flush_day();
             }
-            flush_day();
         }
     };
 
-    std::vector<std::thread> threads;
-    for (unsigned t = 0; t < n_workers; ++t) threads.emplace_back(worker_fn, t);
-    for (auto& t : threads) t.join();
-
-    // 7. Write user_daily & merged campaign_daily
     {
-        std::ofstream out(argv[4], std::ios::binary);
-        out.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
-        out << "user_id,day,sessions,events,revenue_cents,top_category\n";
-        for (const auto& b : user_bufs) out.write(b.data(), b.size());
+        std::vector<std::thread> ts;
+        for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(agg_worker, t);
+        for (auto& t : ts) t.join();
     }
 
-    std::unordered_map<uint64_t, CampAgg> camp_daily;
-    for (const auto& m : camp_locals) {
-        for (const auto& [k, v] : m) {
-            auto& t = camp_daily[k];
-            t.sessions += v.sessions; t.purchasing += v.purchasing; t.rev += v.rev; t.assisted += v.assisted;
+    // 7. Write Parquet Directly (No CSV / DuckDB)
+    fs::create_directories(output_dir / "user_daily");
+    fs::create_directories(output_dir / "campaign_daily");
+
+    {
+        arrow::StringBuilder b_uid, b_cat;
+        arrow::Date32Builder b_day;
+        arrow::Int64Builder b_sess, b_evs, b_rev;
+
+        for (const auto& vec : user_locals) {
+            for (const auto& r : vec) {
+                (void)b_uid.Append(pshards[r.shard].people.values[r.pid]);
+                (void)b_day.Append(r.day);
+                (void)b_sess.Append(r.sessions);
+                (void)b_evs.Append(r.events);
+                (void)b_rev.Append(r.revenue_cents);
+                if (r.top_cat == UINT32_MAX) (void)b_cat.AppendNull();
+                else (void)b_cat.Append(categories.values[r.top_cat]);
+            }
         }
+
+        std::shared_ptr<arrow::Array> a_uid, a_day, a_sess, a_evs, a_rev, a_cat;
+        (void)b_uid.Finish(&a_uid); (void)b_day.Finish(&a_day); (void)b_sess.Finish(&a_sess);
+        (void)b_evs.Finish(&a_evs); (void)b_rev.Finish(&a_rev); (void)b_cat.Finish(&a_cat);
+
+        auto schema = arrow::schema({
+            arrow::field("user_id", arrow::utf8()),
+            arrow::field("day", arrow::date32()),
+            arrow::field("sessions", arrow::int64()),
+            arrow::field("events", arrow::int64()),
+            arrow::field("revenue_cents", arrow::int64()),
+            arrow::field("top_category", arrow::utf8(), true)
+        });
+        auto table = arrow::Table::Make(schema, {a_uid, a_day, a_sess, a_evs, a_rev, a_cat});
+        write_parquet_table(output_dir / "user_daily" / "part-0.parquet", table);
     }
+
     {
-        std::ofstream out(argv[5], std::ios::binary);
-        out.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
-        out << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
+        std::unordered_map<uint64_t, CampAgg> camp_daily;
+        for (const auto& m : camp_locals) {
+            for (const auto& [k, v] : m) {
+                auto& t = camp_daily[k];
+                t.sessions += v.sessions; t.purchasing += v.purchasing; t.rev += v.rev; t.assisted += v.assisted;
+            }
+        }
+
+        arrow::StringBuilder b_cid, b_ch;
+        arrow::Date32Builder b_day;
+        arrow::Int64Builder b_sess, b_purch, b_rev, b_ast;
+
         for (const auto& [k, a] : camp_daily) {
             uint32_t cid = static_cast<uint32_t>(k >> 32);
             int32_t day = static_cast<int32_t>(static_cast<uint32_t>(k));
             bool org = (cid == UINT32_MAX);
-            out << '"' << (org ? "organic" : camp_ids.values[cid]) << "\",\""
-                << (org ? "organic" : camp_channels[cid]) << "\"," << day_to_date(day) << ','
-                << a.sessions << ',' << a.purchasing << ',' << a.rev << ',' << a.assisted << '\n';
+            (void)b_cid.Append(org ? "organic" : camp_ids.values[cid]);
+            (void)b_ch.Append(org ? "organic" : camp_channels[cid]);
+            (void)b_day.Append(day);
+            (void)b_sess.Append(a.sessions);
+            (void)b_purch.Append(a.purchasing);
+            (void)b_rev.Append(a.rev);
+            (void)b_ast.Append(a.assisted);
         }
+
+        std::shared_ptr<arrow::Array> a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast;
+        (void)b_cid.Finish(&a_cid); (void)b_ch.Finish(&a_ch); (void)b_day.Finish(&a_day);
+        (void)b_sess.Finish(&a_sess); (void)b_purch.Finish(&a_purch); (void)b_rev.Finish(&a_rev); (void)b_ast.Finish(&a_ast);
+
+        auto schema = arrow::schema({
+            arrow::field("campaign_id", arrow::utf8()),
+            arrow::field("channel", arrow::utf8()),
+            arrow::field("day", arrow::date32()),
+            arrow::field("sessions", arrow::int64()),
+            arrow::field("purchasing_sessions", arrow::int64()),
+            arrow::field("revenue_cents", arrow::int64()),
+            arrow::field("assisted_sessions", arrow::int64())
+        });
+        auto table = arrow::Table::Make(schema, {a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast});
+        write_parquet_table(output_dir / "campaign_daily" / "part-0.parquet", table);
     }
+
     return 0;
 }
