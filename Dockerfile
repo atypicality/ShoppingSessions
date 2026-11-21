@@ -8,13 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY cpp/main.cpp .
-RUN g++ -O3 -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow
+RUN g++ -O3 -march=x86-64-v3 -flto -s -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
     && curl -sSL https://apache.jfrog.io/artifactory/arrow/debian/apache-arrow-apt-source-latest-bookworm.deb -o arrow.deb \
     && apt-get install -y ./arrow.deb \
-    && apt-get update && apt-get install -y --no-install-recommends libparquet-glib-dev libparquet-dev \
+    && apt-get update && apt-get install -y --no-install-recommends libparquet-dev \
     && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* arrow.deb \
     && useradd --uid 1000 --no-create-home --home-dir /scratch runner
