@@ -48,3 +48,8 @@ generator.exe
 generator.zip
 campaign_daily.csv
 user_daily.csv
+
+# Generated benchmark datasets and local test outputs
+bench-20m/
+out/
+out_bench*/

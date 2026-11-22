@@ -1,7 +1,9 @@
 #include <immintrin.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -9,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
@@ -26,11 +29,11 @@ namespace fs = std::filesystem;
 constexpr int64_t MS_PER_SEC = 1000LL, MS_PER_MIN = 60LL * MS_PER_SEC,
                   MS_PER_HOUR = 60LL * MS_PER_MIN, MS_PER_DAY = 24LL * MS_PER_HOUR,
                   SESSION_GAP_MS = 30LL * MS_PER_MIN, SEVEN_DAYS_MS = 7LL * MS_PER_DAY;
-// Benchmark-verified default: 64 shards and 8 threads (NCPU=8).
-constexpr size_t N_SHARDS = 64;
+constexpr size_t N_SHARDS = 256;
 constexpr size_t SHARD_MASK = N_SHARDS - 1;
 constexpr size_t CHUNK_BYTES = 4 << 20;
 constexpr uint32_t ORGANIC_CID = UINT32_MAX - 1;
+constexpr uint32_t PURCHASE_FLAG = 1u << 31;
 
 inline uint64_t mix64(uint64_t x) noexcept {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
@@ -38,43 +41,70 @@ inline uint64_t mix64(uint64_t x) noexcept {
     return x ^ (x >> 31);
 }
 
+inline uint64_t mum64(uint64_t a, uint64_t b) noexcept {
+#if defined(__SIZEOF_INT128__)
+    __uint128_t r = static_cast<__uint128_t>(a) * b;
+    return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
+#else
+    return mix64(a ^ b);
+#endif
+}
+
 struct Hash128 {
     uint64_t lo, hi;
     bool operator==(const Hash128& o) const noexcept { return lo == o.lo && hi == o.hi; }
 };
 
-inline Hash128 hash128(std::string_view s) noexcept {
-    uint64_t h1 = 0xcbf29ce484222325ULL;
-    uint64_t h2 = 0x9e3779b97f4a7c15ULL;
+inline uint64_t hash64(std::string_view s) noexcept {
+    constexpr uint64_t S0 = 0xa0761d6478bd642fULL;
+    constexpr uint64_t S1 = 0xe7037ed1a0b428dbULL;
+    constexpr uint64_t S2 = 0x8ebc6af09c88c6e3ULL;
     const char* p = s.data();
     size_t n = s.size();
+    uint64_t h = S0 ^ n;
     while (n >= 8) {
         uint64_t v;
         std::memcpy(&v, p, 8);
-        h1 = (h1 ^ v) * 0x100000001b3ULL;
-        h2 = (h2 ^ v) * 0x9e3779b185ebca87ULL;
-        p += 8; n -= 8;
+        h = mum64(v ^ S1, h ^ S2);
+        p += 8;
+        n -= 8;
     }
-    uint64_t tail = 0;
-    for (size_t i = 0; i < n; ++i) tail |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (i * 8);
-    h1 = mix64(h1 ^ tail ^ s.size());
-    h2 = mix64(h2 ^ tail ^ (s.size() * 0x517cc1b727220a95ULL));
-    return {h1, h2};
+    if (n > 0) {
+        uint64_t tail = 0;
+        for (size_t i = 0; i < n; ++i) {
+            tail |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (i * 8);
+        }
+        h = mum64(tail ^ S1, h ^ S2);
+    }
+    return mix64(h);
 }
 
-inline uint64_t hash64(std::string_view s) noexcept {
-    uint64_t h = 0xcbf29ce484222325ULL;
+inline Hash128 hash128(std::string_view s) noexcept {
+    constexpr uint64_t S0 = 0xa0761d6478bd642fULL;
+    constexpr uint64_t S1 = 0xe7037ed1a0b428dbULL;
+    constexpr uint64_t S2 = 0x8ebc6af09c88c6e3ULL;
+    constexpr uint64_t S3 = 0x589965cc75374cc3ULL;
     const char* p = s.data();
     size_t n = s.size();
+    uint64_t h1 = S0 ^ n;
+    uint64_t h2 = S1 ^ (n * S3);
     while (n >= 8) {
         uint64_t v;
         std::memcpy(&v, p, 8);
-        h = (h ^ v) * 0x100000001b3ULL;
-        p += 8; n -= 8;
+        h1 = mum64(v ^ S1, h1 ^ S2);
+        h2 = mum64(v ^ S2, h2 ^ S3);
+        p += 8;
+        n -= 8;
     }
-    uint64_t tail = 0;
-    for (size_t i = 0; i < n; ++i) tail |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (i * 8);
-    return mix64(h ^ tail ^ s.size());
+    if (n > 0) {
+        uint64_t tail = 0;
+        for (size_t i = 0; i < n; ++i) {
+            tail |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (i * 8);
+        }
+        h1 = mum64(tail ^ S1, h1 ^ S2);
+        h2 = mum64(tail ^ S3, h2 ^ S0);
+    }
+    return {mix64(h1), mix64(h2)};
 }
 
 struct FlatStrMap {
@@ -343,7 +373,7 @@ inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) noexcept {
 inline bool parse_2d(const char* p, int& out) noexcept {
     unsigned a = static_cast<unsigned char>(p[0] - '0');
     unsigned b = static_cast<unsigned char>(p[1] - '0');
-    if (a > 9 || b > 9) return false;
+    if ((a > 9) | (b > 9)) return false;
     out = static_cast<int>(a * 10 + b);
     return true;
 }
@@ -365,7 +395,7 @@ inline bool parse_ts(std::string_view s, int64_t& out, DateCache& dc) noexcept {
         uint16_t cur2;
         std::memcpy(&cur8, p, 8);
         std::memcpy(&cur2, p + 8, 2);
-        if (cur8 == dc.d8 && cur2 == dc.d2) {
+        if (__builtin_expect(cur8 == dc.d8 && cur2 == dc.d2, 1)) {
             day_ms = dc.day_ms;
         } else {
             int y1, y2, mo, d;
@@ -380,13 +410,21 @@ inline bool parse_ts(std::string_view s, int64_t& out, DateCache& dc) noexcept {
             dc.day_ms = day_ms;
         }
 
-        int h, mi, sec;
-        if (!parse_2d(p + 11, h) || !parse_2d(p + 14, mi) || !parse_2d(p + 17, sec)) return false;
-        if (h > 23 || mi > 59 || sec > 59) return false;
+        unsigned h1 = static_cast<unsigned char>(p[11] - '0');
+        unsigned h2 = static_cast<unsigned char>(p[12] - '0');
+        unsigned m1 = static_cast<unsigned char>(p[14] - '0');
+        unsigned m2 = static_cast<unsigned char>(p[15] - '0');
+        unsigned s1 = static_cast<unsigned char>(p[17] - '0');
+        unsigned s2 = static_cast<unsigned char>(p[18] - '0');
+        if (__builtin_expect((h1 > 9) | (h2 > 9) | (m1 > 9) | (m2 > 9) | (s1 > 9) | (s2 > 9), 0)) return false;
+        int h = static_cast<int>(h1 * 10 + h2);
+        int mi = static_cast<int>(m1 * 10 + m2);
+        int sec = static_cast<int>(s1 * 10 + s2);
+        if (__builtin_expect((h > 23) | (mi > 59) | (sec > 59), 0)) return false;
 
         int64_t off = 0;
         if (sz == 20) {
-            if (p[19] != 'Z') return false;
+            if (__builtin_expect(p[19] != 'Z', 0)) return false;
         } else {
             if ((p[19] != '+' && p[19] != '-') || p[22] != ':') return false;
             int oh, om;
@@ -498,8 +536,10 @@ struct RawDedupEvent {
 struct ValidEvent {
     int64_t ts;
     int32_t price_cents;
-    uint32_t category_id;
-    bool is_purchase;
+    uint32_t cat_flags;
+
+    inline uint32_t category_id() const noexcept { return cat_flags & ~PURCHASE_FLAG; }
+    inline bool is_purchase() const noexcept { return (cat_flags & PURCHASE_FLAG) != 0; }
 };
 
 struct PersonEventMsg {
@@ -528,11 +568,6 @@ struct PersonClickMsg {
     ValidClick ck;
 };
 
-// Hybrid sorting: comparison sort for small per-user collections, stable radix
-// sort for larger collections. The passes with constant timestamp bytes are
-// skipped, so nearby timestamps generally require only 3-5 radix passes.
-// Timestamps are signed int64; flipping the sign bit makes their unsigned
-// representation order-preserving.
 #ifndef SHOPPING_RADIX_THRESHOLD
 #define SHOPPING_RADIX_THRESHOLD 1024
 #endif
@@ -552,7 +587,7 @@ inline void radix_sort_timestamp(T* data, size_t n, std::vector<T>& scratch) {
     uint64_t differing_bits = 0;
     for (size_t i = 1; i < n; ++i)
         differing_bits |= (static_cast<uint64_t>(data[i].ts) ^ SIGN_BIT) ^ first_key;
-    if (!differing_bits) return; // already sorted: all timestamps equal
+    if (!differing_bits) return;
 
     scratch.resize(n);
     T* src = data;
@@ -579,10 +614,6 @@ inline void radix_sort_timestamp(T* data, size_t n, std::vector<T>& scratch) {
     if (src != data) std::copy(src, src + n, data);
 }
 
-// After timestamp-only sorting of clicks, the attribution code expects the
-// FIRST click of the final tied timestamp group to have the lexicographically
-// smallest click ID. Selecting that record once per tie group preserves this
-// rule without repeatedly comparing strings during sort or attribution.
 inline void promote_smallest_click_id_in_ties(ValidClick* clicks, size_t n) {
     for (size_t begin = 0; begin < n;) {
         size_t end = begin + 1;
@@ -596,8 +627,6 @@ inline void promote_smallest_click_id_in_ties(ValidClick* clicks, size_t n) {
     }
 }
 
-// Use a more compact open-addressing table than 50% default occupancy.
-// Change SHOPPING_DEDUP_LOAD and A/B benchmark if different input distributions favor it.
 #ifndef SHOPPING_DEDUP_LOAD
 #define SHOPPING_DEDUP_LOAD 70
 #endif
@@ -734,6 +763,8 @@ struct PersonShard {
     FlatStrMap people;
     std::vector<uint32_t> ev_offsets;
     std::unique_ptr<ValidEvent[]> flat_events;
+    std::mutex msg_mtx;
+    std::vector<PersonEventMsg> staged_msgs;
 };
 
 struct UserRow {
@@ -776,6 +807,14 @@ int main(int argc, char** argv) {
     unsigned n_workers = std::thread::hardware_concurrency();
     if (const char* env = std::getenv("NCPU")) if (auto v = std::atoi(env); v > 0) n_workers = v;
     n_workers = std::max(1u, n_workers);
+
+    auto t_last = std::chrono::steady_clock::now();
+    auto lap = [&](const char* name) {
+        auto now = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - t_last).count();
+        std::fprintf(stderr, "[%s] %lld ms\n", name, static_cast<long long>(ms));
+        t_last = now;
+    };
 
     int64_t win_start = 0, win_end = 0;
     {
@@ -832,8 +871,6 @@ int main(int argc, char** argv) {
     });
 
     UnionFind uf;
-    // Build identity links concurrently with event ingestion using at most 2 threads
-    // so we don't oversubscribe the 8 vCPUs during event parsing.
     std::thread t_links([&]() {
     {
         auto link_files = list_csvs(data_dir / "links");
@@ -881,7 +918,8 @@ int main(int argc, char** argv) {
     }
     uf.freeze();
     });
-    t_prod.join(); // needed for category lookups during event parsing
+    t_prod.join();
+    lap("1_prod");
 
     std::vector<MMapFile> event_mmaps;
     size_t total_ev_bytes = 0;
@@ -890,7 +928,7 @@ int main(int argc, char** argv) {
         if (f.open(p)) { total_ev_bytes += f.size; event_mmaps.push_back(std::move(f)); }
     }
     auto ev_chunks = make_chunks(event_mmaps);
-    const size_t est_ev_per_bucket = total_ev_bytes / (100 * n_workers * N_SHARDS) + 32;
+    const size_t est_ev_per_bucket = total_ev_bytes / (90 * n_workers * N_SHARDS) + 64;
 
     std::vector<std::vector<std::vector<RawDedupEvent>>> ev_buckets(
         n_workers, std::vector<std::vector<RawDedupEvent>>(N_SHARDS));
@@ -923,8 +961,15 @@ int main(int argc, char** argv) {
                         ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
                         bool ok = true, is_purch = false;
                         int32_t price = 0;
-                        if (c[4] == "purchase") { is_purch = true; ok = parse_price(c[6], price); }
-                        else if (c[4] != "view" && c[4] != "cart") ok = false;
+                        const size_t et_len = c[4].size();
+                        if (et_len == 4 && (std::memcmp(c[4].data(), "view", 4) == 0 || std::memcmp(c[4].data(), "cart", 4) == 0)) {
+                            // valid view/cart
+                        } else if (et_len == 8 && std::memcmp(c[4].data(), "purchase", 8) == 0) {
+                            is_purch = true;
+                            ok = parse_price(c[6], price);
+                        } else {
+                            ok = false;
+                        }
 
                         if (ok) {
                             uint32_t cat_id = unknown_cat;
@@ -946,20 +991,22 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
+    lap("4a_ev_parse");
     t_links.join();
     t_camp.join();
+    lap("3_links_join");
 
-    std::vector<std::vector<std::vector<PersonEventMsg>>> pev_buckets(
-        n_workers, std::vector<std::vector<PersonEventMsg>>(N_SHARDS));
+    std::vector<PersonShard> pshards(N_SHARDS);
     {
-        const size_t est_pev_per_bucket = total_ev_bytes / (120 * n_workers * N_SHARDS) + 32;
+        const size_t est_shard_msgs = total_ev_bytes / (100 * N_SHARDS) + 64;
+        for (size_t s = 0; s < N_SHARDS; ++s) pshards[s].staged_msgs.reserve(est_shard_msgs);
+
         std::atomic<size_t> next_s{0};
         const bool has_uf = (uf.map.count > 0);
         const size_t uf_mask = uf.map.mask;
-        auto worker = [&](unsigned tid) {
-            auto& my_pb = pev_buckets[tid];
-            for (auto& b : my_pb) b.reserve(est_pev_per_bucket);
+        auto worker = [&]() {
             FlatEventMap map;
+            std::vector<PersonEventMsg> local_out[N_SHARDS];
             constexpr size_t B = 16;
             uint64_t uhashes[B];
             while (true) {
@@ -978,9 +1025,9 @@ int main(int argc, char** argv) {
                         if (i + 16 < n) __builtin_prefetch(&map.slots[vec[i + 16].eid_hash.lo & mask], 1, 1);
                         map.insert_or_min(vec[i]);
                     }
-                    std::vector<RawDedupEvent>().swap(ev_buckets[t][s]);
                 }
 
+                for (size_t b = 0; b < N_SHARDS; ++b) local_out[b].clear();
                 const size_t np = map.payloads.size();
                 for (size_t base = 0; base < np; base += B) {
                     const size_t lim = std::min(np, base + B);
@@ -996,21 +1043,29 @@ int main(int argc, char** argv) {
                         if (!(e.price_flags & 1u)) continue;
                         std::string_view u(e.user_ptr, e.ulen_cat >> 16);
                         auto [person, ph] = uf.canonical_with_hash_prehashed(u, uhashes[i - base]);
-                        my_pb[ph & SHARD_MASK].push_back({
+                        uint32_t cat_flags = (e.ulen_cat & 0xFFFFu) | ((e.price_flags & 2u) ? PURCHASE_FLAG : 0u);
+                        local_out[ph & SHARD_MASK].push_back({
                             ph, person,
-                            ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), e.ulen_cat & 0xFFFFu, (e.price_flags & 2u) != 0}
+                            ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), cat_flags}
                         });
                     }
+                }
+
+                for (size_t b = 0; b < N_SHARDS; ++b) {
+                    if (local_out[b].empty()) continue;
+                    std::lock_guard<std::mutex> lk(pshards[b].msg_mtx);
+                    auto& dst = pshards[b].staged_msgs;
+                    dst.insert(dst.end(), local_out[b].begin(), local_out[b].end());
                 }
             }
         };
         std::vector<std::thread> ts;
-        for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
+        for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker);
         for (auto& t : ts) t.join();
     }
     ev_buckets.clear();
+    lap("4b_ev_dedup");
 
-    std::vector<PersonShard> pshards(N_SHARDS);
     {
         std::atomic<size_t> next_ps{0};
         auto worker = [&]() {
@@ -1020,8 +1075,7 @@ int main(int argc, char** argv) {
                 size_t ps = next_ps.fetch_add(1, std::memory_order_relaxed);
                 if (ps >= N_SHARDS) break;
                 auto& sh = pshards[ps];
-                size_t total = 0;
-                for (unsigned t = 0; t < n_workers; ++t) total += pev_buckets[t][ps].size();
+                const size_t total = sh.staged_msgs.size();
                 if (total == 0) continue;
 
                 sh.people.init(total / 4 + 32, total * 4 + 256);
@@ -1029,13 +1083,11 @@ int main(int argc, char** argv) {
                 pids.reserve(total);
                 counts.clear();
 
-                for (unsigned t = 0; t < n_workers; ++t) {
-                    for (const auto& msg : pev_buckets[t][ps]) {
-                        uint32_t pid = sh.people.get_id(msg.person, msg.phash);
-                        if (pid >= counts.size()) counts.resize(pid + 1, 0);
-                        ++counts[pid];
-                        pids.push_back(pid);
-                    }
+                for (const auto& msg : sh.staged_msgs) {
+                    uint32_t pid = sh.people.get_id(msg.person, msg.phash);
+                    if (pid >= counts.size()) counts.resize(pid + 1, 0);
+                    ++counts[pid];
+                    pids.push_back(pid);
                 }
 
                 const size_t n_people = counts.size();
@@ -1049,21 +1101,18 @@ int main(int argc, char** argv) {
                 sh.ev_offsets[n_people] = sum;
                 sh.flat_events = std::make_unique_for_overwrite<ValidEvent[]>(sum);
 
-                size_t idx = 0;
-                for (unsigned t = 0; t < n_workers; ++t) {
-                    for (const auto& msg : pev_buckets[t][ps]) {
-                        sh.flat_events[counts[pids[idx++]]++] = msg.ev;
-                    }
-                    std::vector<PersonEventMsg>().swap(pev_buckets[t][ps]);
+                for (size_t idx = 0; idx < total; ++idx) {
+                    sh.flat_events[counts[pids[idx]]++] = sh.staged_msgs[idx].ev;
                 }
+                std::vector<PersonEventMsg>().swap(sh.staged_msgs);
             }
         };
         std::vector<std::thread> ts;
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker);
         for (auto& t : ts) t.join();
     }
-    pev_buckets.clear();
     event_mmaps.clear();
+    lap("4c_pshards");
 
     std::vector<MMapFile> click_mmaps;
     size_t total_ck_bytes = 0;
@@ -1072,7 +1121,7 @@ int main(int argc, char** argv) {
         if (f.open(p)) { total_ck_bytes += f.size; click_mmaps.push_back(std::move(f)); }
     }
     auto ck_chunks = make_chunks(click_mmaps);
-    const size_t est_ck_per_bucket = total_ck_bytes / (80 * n_workers * N_SHARDS) + 32;
+    const size_t est_ck_per_bucket = total_ck_bytes / (75 * n_workers * N_SHARDS) + 64;
 
     std::vector<std::vector<std::vector<RawClickMsg>>> ck_buckets(
         n_workers, std::vector<std::vector<RawClickMsg>>(N_SHARDS));
@@ -1148,6 +1197,7 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
+    lap("5a_ck_parse");
 
     std::vector<std::vector<std::vector<PersonClickMsg>>> pck_buckets(
         n_workers, std::vector<std::vector<PersonClickMsg>>(N_SHARDS));
@@ -1170,7 +1220,6 @@ int main(int argc, char** argv) {
                             my_pb[r.ps].push_back({r.pid, ValidClick{r.ts, r.cid, r.camp}});
                         }
                     }
-                    std::vector<RawClickMsg>().swap(ck_buckets[t][s]);
                 }
             }
         };
@@ -1179,6 +1228,7 @@ int main(int argc, char** argv) {
         for (auto& t : ts) t.join();
     }
     ck_buckets.clear();
+    lap("5b_ck_dedup");
 
     fs::create_directories(output_dir / "user_daily");
     fs::create_directories(output_dir / "campaign_daily");
@@ -1209,7 +1259,6 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> ck_offsets;
         std::vector<uint32_t> ck_pos;
         std::vector<ValidClick> flat_clicks;
-        // Scratch is retained per aggregation worker, not reallocated per user.
         std::vector<ValidEvent> event_radix_scratch;
         std::vector<ValidClick> click_radix_scratch;
 
@@ -1231,7 +1280,6 @@ int main(int argc, char** argv) {
             flat_clicks.resize(total_cks);
             for (unsigned t = 0; t < n_workers; ++t) {
                 for (const auto& m : pck_buckets[t][ps]) flat_clicks[ck_pos[m.pid]++] = m.ck;
-                std::vector<PersonClickMsg>().swap(pck_buckets[t][ps]);
             }
 
             for (uint32_t pid = 0; pid < n_people; ++pid) {
@@ -1258,8 +1306,6 @@ int main(int argc, char** argv) {
 #if SHOPPING_RADIX_CLICKS
                     if (n_cks >= SHOPPING_RADIX_THRESHOLD) {
                         radix_sort_timestamp(clicks, n_cks, click_radix_scratch);
-                        // Attribution assumes the first record in each timestamp
-                        // tie has the smallest ID, just like the old comparator.
                         promote_smallest_click_id_in_ties(clicks, n_cks);
                     } else
 #endif
@@ -1304,11 +1350,11 @@ int main(int argc, char** argv) {
                     while (i < n_evs && evs[i].ts - prev_ts <= SESSION_GAP_MS) {
                         prev_ts = evs[i].ts;
                         d_evs += 1;
-                        if (evs[i].is_purchase) {
+                        if (evs[i].is_purchase()) {
                             has_purch = true;
                             s_rev += evs[i].price_cents;
                             d_rev += evs[i].price_cents;
-                            uint32_t c = evs[i].category_id;
+                            uint32_t c = evs[i].category_id();
                             if (cat_rev[c] == 0) touched_cats.push_back(c);
                             cat_rev[c] += evs[i].price_cents;
                         }
@@ -1402,6 +1448,7 @@ int main(int argc, char** argv) {
         write_parquet_table(output_dir / "user_daily" / "part-0.parquet",
                             arrow::Table::Make(user_schema, {a_uid, a_day, a_sess, a_evs, a_rev, a_cat}));
     }
+    lap("6_agg_user_parquet");
 
     {
         FlatCampMap camp_daily;
@@ -1464,5 +1511,7 @@ int main(int argc, char** argv) {
         write_parquet_table(output_dir / "campaign_daily" / "part-0.parquet",
                             arrow::Table::Make(schema, {a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast}));
     }
+    lap("7_camp_parquet");
+    std::fflush(stderr);
     ::_exit(0);
 }
