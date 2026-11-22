@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
@@ -348,7 +349,8 @@ inline bool parse_2d(const char* p, int& out) noexcept {
 }
 
 struct DateCache {
-    char date[10] = {};
+    uint64_t d8 = 0;
+    uint16_t d2 = 0;
     int64_t day_ms = 0;
 };
 
@@ -359,7 +361,11 @@ inline bool parse_ts(std::string_view s, int64_t& out, DateCache& dc) noexcept {
 
     if ((sz == 20 || sz == 25) && p[4] == '-' && p[7] == '-' && p[10] == 'T' && p[13] == ':' && p[16] == ':') {
         int64_t day_ms;
-        if (std::memcmp(p, dc.date, 10) == 0) {
+        uint64_t cur8;
+        uint16_t cur2;
+        std::memcpy(&cur8, p, 8);
+        std::memcpy(&cur2, p + 8, 2);
+        if (cur8 == dc.d8 && cur2 == dc.d2) {
             day_ms = dc.day_ms;
         } else {
             int y1, y2, mo, d;
@@ -369,7 +375,8 @@ inline bool parse_ts(std::string_view s, int64_t& out, DateCache& dc) noexcept {
             int dim = (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) ? 29 : (mo >= 1 && mo <= 12 ? mdays[mo] : 0);
             if (mo < 1 || mo > 12 || d < 1 || d > dim) return false;
             day_ms = days_from_civil(y, mo, d) * MS_PER_DAY;
-            std::memcpy(dc.date, p, 10);
+            dc.d8 = cur8;
+            dc.d2 = cur2;
             dc.day_ms = day_ms;
         }
 
@@ -726,7 +733,7 @@ struct FlatCampMap {
 struct PersonShard {
     FlatStrMap people;
     std::vector<uint32_t> ev_offsets;
-    std::vector<ValidEvent> flat_events;
+    std::unique_ptr<ValidEvent[]> flat_events;
 };
 
 struct UserRow {
@@ -754,6 +761,7 @@ void write_parquet_table(const fs::path& path, const std::shared_ptr<arrow::Tabl
     if (!out_res.ok()) { std::cerr << out_res.status().ToString() << "\n"; std::exit(1); }
     auto props = parquet::WriterProperties::Builder()
                      .compression(arrow::Compression::UNCOMPRESSED)
+                     ->disable_dictionary("user_id")
                      ->build();
     auto st = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out_res, 1 << 20, props);
     if (!st.ok()) { std::cerr << st.ToString() << "\n"; std::exit(1); }
@@ -824,9 +832,8 @@ int main(int argc, char** argv) {
     });
 
     UnionFind uf;
-    // Main optimization: build identity links concurrently with event ingestion.
-    // Event parsing needs the products table but does not read UnionFind.
-    // Joining t_links before dedup establishes safe read-after-write synchronization.
+    // Build identity links concurrently with event ingestion using at most 2 threads
+    // so we don't oversubscribe the 8 vCPUs during event parsing.
     std::thread t_links([&]() {
     {
         auto link_files = list_csvs(data_dir / "links");
@@ -838,12 +845,13 @@ int main(int argc, char** argv) {
         }
         auto lchunks = make_chunks(lmmaps);
         if (!lchunks.empty()) {
+            const unsigned l_workers = std::min(2u, n_workers);
             struct LinkPair { std::string_view a, b; uint64_t ha, hb; };
-            std::vector<std::vector<LinkPair>> l_locals(n_workers);
+            std::vector<std::vector<LinkPair>> l_locals(l_workers);
             std::atomic<size_t> next_lc{0};
             auto lworker = [&](unsigned tid) {
                 auto& out = l_locals[tid];
-                out.reserve(lbytes / (24 * n_workers) + 64);
+                out.reserve(lbytes / (24 * l_workers) + 64);
                 std::string_view c[2];
                 while (true) {
                     size_t idx = next_lc.fetch_add(1, std::memory_order_relaxed);
@@ -862,7 +870,7 @@ int main(int argc, char** argv) {
                 }
             };
             std::vector<std::thread> ts;
-            for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(lworker, t);
+            for (unsigned t = 0; t < l_workers; ++t) ts.emplace_back(lworker, t);
             for (auto& t : ts) t.join();
 
             uf.map.init(lbytes / 20 + 64, lbytes);
@@ -891,7 +899,7 @@ int main(int argc, char** argv) {
         auto worker = [&](unsigned tid) {
             auto& my_b = ev_buckets[tid];
             for (auto& b : my_b) b.reserve(est_ev_per_bucket);
-            DateCache dc;
+            DateCache dc_in, dc_ev;
             std::string_view c[7];
             while (true) {
                 size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -906,12 +914,12 @@ int main(int argc, char** argv) {
 
                     if (!parse_csv(ln, 7, c) || c[0].empty()) continue;
                     int64_t ingest_ts = 0;
-                    if (!parse_ts(c[3], ingest_ts, dc)) continue;
+                    if (!parse_ts(c[3], ingest_ts, dc_in)) continue;
 
                     Hash128 h = hash128(c[0]);
                     RawDedupEvent ev{h, ingest_ts, 0, nullptr, 0, 0};
                     int64_t ts = 0;
-                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts, dc) &&
+                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts, dc_ev) &&
                         ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
                         bool ok = true, is_purch = false;
                         int32_t price = 0;
@@ -1039,7 +1047,7 @@ int main(int argc, char** argv) {
                     counts[i] = sh.ev_offsets[i];
                 }
                 sh.ev_offsets[n_people] = sum;
-                sh.flat_events.resize(sum);
+                sh.flat_events = std::make_unique_for_overwrite<ValidEvent[]>(sum);
 
                 size_t idx = 0;
                 for (unsigned t = 0; t < n_workers; ++t) {
@@ -1230,7 +1238,7 @@ int main(int argc, char** argv) {
                 uint32_t ev_b = sh.ev_offsets[pid], ev_e = sh.ev_offsets[pid + 1];
                 if (ev_b == ev_e) continue;
 
-                ValidEvent* evs = sh.flat_events.data() + ev_b;
+                ValidEvent* evs = sh.flat_events.get() + ev_b;
                 const size_t n_evs = ev_e - ev_b;
                 if (n_evs > 1) {
 #if SHOPPING_RADIX_EVENTS
