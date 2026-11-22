@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -270,7 +271,7 @@ std::vector<ByteChunk> make_chunks(const std::vector<MMapFile>& files) {
     return chunks;
 }
 
-inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) noexcept {
+inline bool parse_csv_slow(std::string_view line, size_t n, std::string_view* out) noexcept {
     const size_t len = line.size();
     if (len == 0) return false;
     const char* p = line.data();
@@ -289,6 +290,44 @@ inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) no
         if (!comma) return idx == n;
         start = static_cast<size_t>(comma - p) + 1;
     }
+}
+
+inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) noexcept {
+    const size_t len = line.size();
+    if (len == 0) return false;
+    const char* p = line.data();
+    const __m256i v_comma = _mm256_set1_epi8(',');
+    const __m256i v_quote = _mm256_set1_epi8('"');
+
+    size_t idx = 0, start = 0, pos = 0;
+    while (pos + 32 <= len) {
+        const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + pos));
+        const uint32_t qmask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_quote)));
+        if (__builtin_expect(qmask != 0, 0)) return parse_csv_slow(line, n, out);
+
+        uint32_t cmask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)));
+        while (cmask) {
+            const size_t cpos = pos + static_cast<size_t>(__builtin_ctz(cmask));
+            if (__builtin_expect(idx >= n, 0)) return false;
+            out[idx++] = std::string_view(p + start, cpos - start);
+            start = cpos + 1;
+            cmask &= cmask - 1;
+        }
+        pos += 32;
+    }
+
+    for (; pos < len; ++pos) {
+        const char ch = p[pos];
+        if (__builtin_expect(ch == '"', 0)) return parse_csv_slow(line, n, out);
+        if (ch == ',') {
+            if (__builtin_expect(idx >= n, 0)) return false;
+            out[idx++] = std::string_view(p + start, pos - start);
+            start = pos + 1;
+        }
+    }
+    if (idx + 1 != n) return false;
+    out[idx] = std::string_view(p + start, len - start);
+    return true;
 }
 
 inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) noexcept {
