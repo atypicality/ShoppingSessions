@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Compile Python files
-        run: python -m compileall -q pipeline scripts
+        run: python -m compileall -q scripts
 
       - name: Compile C++ builder stage
         run: docker buildx build --platform linux/amd64 --target builder .

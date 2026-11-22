@@ -1,8 +1,6 @@
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -732,14 +730,6 @@ int main(int argc, char** argv) {
     if (const char* env = std::getenv("NCPU")) if (auto v = std::atoi(env); v > 0) n_workers = v;
     n_workers = std::max(1u, n_workers);
 
-    auto t_last = std::chrono::steady_clock::now();
-    auto lap = [&](const char* name) {
-        auto now = std::chrono::steady_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - t_last).count();
-        std::fprintf(stderr, "[%s] %lld ms\n", name, static_cast<long long>(ms));
-        t_last = now;
-    };
-
     int64_t win_start = 0, win_end = 0;
     {
         std::ifstream mf(data_dir / "manifest.json");
@@ -845,7 +835,6 @@ int main(int argc, char** argv) {
     uf.freeze();
     });
     t_prod.join(); // needed for category lookups during event parsing
-    lap("1_products_ready_links_parallel");
 
     std::vector<MMapFile> event_mmaps;
     size_t total_ev_bytes = 0;
@@ -910,10 +899,8 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
-    lap("4a_ev_parse_overlap_links");
     t_links.join();
     t_camp.join();
-    lap("3_links_campaigns_join");
 
     std::vector<std::vector<std::vector<PersonEventMsg>>> pev_buckets(
         n_workers, std::vector<std::vector<PersonEventMsg>>(N_SHARDS));
@@ -975,7 +962,6 @@ int main(int argc, char** argv) {
         for (auto& t : ts) t.join();
     }
     ev_buckets.clear();
-    lap("4b_ev_dedup");
 
     std::vector<PersonShard> pshards(N_SHARDS);
     {
@@ -1031,7 +1017,6 @@ int main(int argc, char** argv) {
     }
     pev_buckets.clear();
     event_mmaps.clear();
-    lap("4c_pshards");
 
     std::vector<MMapFile> click_mmaps;
     size_t total_ck_bytes = 0;
@@ -1116,7 +1101,6 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < n_workers; ++t) ts.emplace_back(worker, t);
         for (auto& t : ts) t.join();
     }
-    lap("5a_ck_parse");
 
     std::vector<std::vector<std::vector<PersonClickMsg>>> pck_buckets(
         n_workers, std::vector<std::vector<PersonClickMsg>>(N_SHARDS));
@@ -1148,7 +1132,6 @@ int main(int argc, char** argv) {
         for (auto& t : ts) t.join();
     }
     ck_buckets.clear();
-    lap("5b_ck_dedup");
 
     fs::create_directories(output_dir / "user_daily");
     fs::create_directories(output_dir / "campaign_daily");
@@ -1372,7 +1355,6 @@ int main(int argc, char** argv) {
         write_parquet_table(output_dir / "user_daily" / "part-0.parquet",
                             arrow::Table::Make(user_schema, {a_uid, a_day, a_sess, a_evs, a_rev, a_cat}));
     }
-    lap("6_agg_user_parquet");
 
     {
         FlatCampMap camp_daily;
@@ -1435,8 +1417,5 @@ int main(int argc, char** argv) {
         write_parquet_table(output_dir / "campaign_daily" / "part-0.parquet",
                             arrow::Table::Make(schema, {a_cid, a_ch, a_day, a_sess, a_purch, a_rev, a_ast}));
     }
-    lap("7_camp_parquet");
-
-    std::fflush(nullptr);
     ::_exit(0);
 }

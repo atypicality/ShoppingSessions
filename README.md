@@ -11,7 +11,7 @@ If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizer
 
 - Read `rules.md` for the full rules.
 - Implement the processing rules in `cpp/main.cpp`.
-- `pipeline/pipeline2.py` launches the compiled C++ engine and converts its intermediate results to Parquet.
+- The compiled C++ engine writes the Parquet output directly.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -70,7 +70,7 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 ## Common pitfalls
 
 - **DuckDB's CSV reader differs from `rules.md`.** It reads a quoted empty field `""` as an empty string, not null. Its malformed-line handling, including `ignore_errors`, `strict_mode`, and `null_padding`, does not match `rules.md`. Test against the fixtures before relying on it.
-- **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
+- **Memory.** The C++ engine processes the data in bounded stages and uses `/scratch` only for container-managed temporary files.
 - **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
@@ -84,7 +84,7 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 ## Files in this starter
 
 - `cpp/main.cpp` holds the processing engine.
-- `pipeline/pipeline2.py` launches the engine and writes Parquet output.
+- `cpp/main.cpp` is compiled into the container entrypoint and writes Parquet output directly.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
 - `scripts/` runs your image the way the scorer does and diffs the output.
