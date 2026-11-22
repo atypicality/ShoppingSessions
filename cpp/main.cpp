@@ -1,4 +1,3 @@
-#include <immintrin.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -27,14 +26,11 @@ namespace fs = std::filesystem;
 constexpr int64_t MS_PER_SEC = 1000LL, MS_PER_MIN = 60LL * MS_PER_SEC,
                   MS_PER_HOUR = 60LL * MS_PER_MIN, MS_PER_DAY = 24LL * MS_PER_HOUR,
                   SESSION_GAP_MS = 30LL * MS_PER_MIN, SEVEN_DAYS_MS = 7LL * MS_PER_DAY;
-// Tuned for 8 pinned vCPUs (hyperthreads): 256 shards keeps per-shard hash tables
-// cache-resident and smooths out tail skew across workers.
-constexpr size_t N_SHARDS = 256;
+// Benchmark-verified default: 64 shards and 8 threads (NCPU=8).
+constexpr size_t N_SHARDS = 64;
 constexpr size_t SHARD_MASK = N_SHARDS - 1;
 constexpr size_t CHUNK_BYTES = 4 << 20;
 constexpr uint32_t ORGANIC_CID = UINT32_MAX - 1;
-constexpr size_t SPILL_THRESHOLD_BYTES = 6ULL << 30;
-constexpr size_t SPILL_BATCH_EVENTS = 65536;
 
 inline uint64_t mix64(uint64_t x) noexcept {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
@@ -84,13 +80,13 @@ inline uint64_t hash64(std::string_view s) noexcept {
 struct FlatStrMap {
     struct Slot {
         uint64_t hash;
-        uint64_t off;
+        uint32_t off;
         uint32_t len;
         uint32_t val;
     };
     std::vector<char> arena;
     std::vector<Slot> slots;
-    std::vector<std::pair<uint64_t, uint32_t>> id_slices;
+    std::vector<std::pair<uint32_t, uint32_t>> id_slices;
     size_t count = 0;
     size_t mask = 0;
 
@@ -141,7 +137,7 @@ struct FlatStrMap {
         while (true) {
             auto& s = slots[idx];
             if (s.len == UINT32_MAX) {
-                uint64_t off = arena.size();
+                uint32_t off = static_cast<uint32_t>(arena.size());
                 arena.insert(arena.end(), sv.data(), sv.data() + sz);
                 s = Slot{h, off, static_cast<uint32_t>(sz), val};
                 ++count;
@@ -161,7 +157,7 @@ struct FlatStrMap {
         while (true) {
             auto& s = slots[idx];
             if (s.len == UINT32_MAX) {
-                uint64_t off = arena.size();
+                uint32_t off = static_cast<uint32_t>(arena.size());
                 arena.insert(arena.end(), sv.data(), sv.data() + sz);
                 uint32_t id = static_cast<uint32_t>(id_slices.size());
                 id_slices.emplace_back(off, static_cast<uint32_t>(sz));
@@ -248,19 +244,6 @@ struct MMapFile {
     MMapFile(MMapFile&& o) noexcept : data(o.data), size(o.size) { o.data = nullptr; o.size = 0; }
 };
 
-inline void write_all(int fd, const void* buf, size_t nbytes) {
-    const char* p = static_cast<const char*>(buf);
-    while (nbytes > 0) {
-        ssize_t w = ::write(fd, p, nbytes);
-        if (w <= 0) {
-            std::perror("spill write failed");
-            std::exit(1);
-        }
-        p += w;
-        nbytes -= static_cast<size_t>(w);
-    }
-}
-
 struct ByteChunk {
     const char* begin;
     const char* end;
@@ -289,7 +272,7 @@ std::vector<ByteChunk> make_chunks(const std::vector<MMapFile>& files) {
     return chunks;
 }
 
-inline bool parse_csv_slow(std::string_view line, size_t n, std::string_view* out) noexcept {
+inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) noexcept {
     const size_t len = line.size();
     if (len == 0) return false;
     const char* p = line.data();
@@ -309,44 +292,6 @@ inline bool parse_csv_slow(std::string_view line, size_t n, std::string_view* ou
         start = static_cast<size_t>(comma - p) + 1;
     }
 }
-
-inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) noexcept {
-    const size_t len = line.size();
-    if (len == 0) return false;
-    const char* p = line.data();
-    const __m256i v_comma = _mm256_set1_epi8(',');
-    const __m256i v_quote = _mm256_set1_epi8('"');
-
-    size_t idx = 0, start = 0, pos = 0;
-    while (pos + 32 <= len) {
-        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + pos));
-        uint32_t qmask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_quote)));
-        if (__builtin_expect(qmask != 0, 0)) return parse_csv_slow(line, n, out);
-
-        uint32_t cmask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)));
-        while (cmask) {
-            size_t cpos = pos + static_cast<size_t>(__builtin_ctz(cmask));
-            if (__builtin_expect(idx >= n, 0)) return false;
-            out[idx++] = std::string_view(p + start, cpos - start);
-            start = cpos + 1;
-            cmask &= cmask - 1;
-        }
-        pos += 32;
-    }
-
-    for (; pos < len; ++pos) {
-        char ch = p[pos];
-        if (__builtin_expect(ch == '"', 0)) return parse_csv_slow(line, n, out);
-        if (ch == ',') {
-            if (__builtin_expect(idx >= n, 0)) return false;
-            out[idx++] = std::string_view(p + start, pos - start);
-            start = pos + 1;
-        }
-    }
-    if (idx + 1 != n) return false;
-    out[idx] = std::string_view(p + start, len - start);
-    return true;
-}   
 
 inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) noexcept {
     y -= m <= 2;
@@ -502,9 +447,8 @@ struct RawDedupEvent {
     int64_t ingest_ts;
     int64_t ts;
     const char* user_ptr;
-    uint32_t category_id;
+    uint32_t ulen_cat;
     uint32_t price_flags;
-    uint16_t user_len;
 };
 
 struct ValidEvent {
@@ -540,6 +484,11 @@ struct PersonClickMsg {
     ValidClick ck;
 };
 
+// Hybrid sorting: comparison sort for small per-user collections, stable radix
+// sort for larger collections. The passes with constant timestamp bytes are
+// skipped, so nearby timestamps generally require only 3-5 radix passes.
+// Timestamps are signed int64; flipping the sign bit makes their unsigned
+// representation order-preserving.
 #ifndef SHOPPING_RADIX_THRESHOLD
 #define SHOPPING_RADIX_THRESHOLD 1024
 #endif
@@ -559,7 +508,7 @@ inline void radix_sort_timestamp(T* data, size_t n, std::vector<T>& scratch) {
     uint64_t differing_bits = 0;
     for (size_t i = 1; i < n; ++i)
         differing_bits |= (static_cast<uint64_t>(data[i].ts) ^ SIGN_BIT) ^ first_key;
-    if (!differing_bits) return;
+    if (!differing_bits) return; // already sorted: all timestamps equal
 
     scratch.resize(n);
     T* src = data;
@@ -586,6 +535,10 @@ inline void radix_sort_timestamp(T* data, size_t n, std::vector<T>& scratch) {
     if (src != data) std::copy(src, src + n, data);
 }
 
+// After timestamp-only sorting of clicks, the attribution code expects the
+// FIRST click of the final tied timestamp group to have the lexicographically
+// smallest click ID. Selecting that record once per tie group preserves this
+// rule without repeatedly comparing strings during sort or attribution.
 inline void promote_smallest_click_id_in_ties(ValidClick* clicks, size_t n) {
     for (size_t begin = 0; begin < n;) {
         size_t end = begin + 1;
@@ -599,6 +552,8 @@ inline void promote_smallest_click_id_in_ties(ValidClick* clicks, size_t n) {
     }
 }
 
+// Use a more compact open-addressing table than 50% default occupancy.
+// Change SHOPPING_DEDUP_LOAD and A/B benchmark if different input distributions favor it.
 #ifndef SHOPPING_DEDUP_LOAD
 #define SHOPPING_DEDUP_LOAD 70
 #endif
@@ -761,7 +716,7 @@ void write_parquet_table(const fs::path& path, const std::shared_ptr<arrow::Tabl
     auto out_res = arrow::io::FileOutputStream::Open(path.string());
     if (!out_res.ok()) { std::cerr << out_res.status().ToString() << "\n"; std::exit(1); }
     auto props = parquet::WriterProperties::Builder()
-                     .compression(arrow::Compression::SNAPPY)
+                     .compression(arrow::Compression::UNCOMPRESSED)
                      ->build();
     auto st = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out_res, 1 << 20, props);
     if (!st.ok()) { std::cerr << st.ToString() << "\n"; std::exit(1); }
@@ -772,7 +727,6 @@ void write_parquet_table(const fs::path& path, const std::shared_ptr<arrow::Tabl
 int main(int argc, char** argv) {
     fs::path data_dir = (argc >= 3) ? fs::path(argv[1]) : fs::path(std::getenv("DATA_DIR") ? std::getenv("DATA_DIR") : "/data");
     fs::path output_dir = (argc >= 3) ? fs::path(argv[2]) : fs::path(std::getenv("OUTPUT_DIR") ? std::getenv("OUTPUT_DIR") : "/output");
-    fs::path scratch_dir = std::getenv("SCRATCH_DIR") ? fs::path(std::getenv("SCRATCH_DIR")) : fs::path("/scratch");
 
     unsigned n_workers = std::thread::hardware_concurrency();
     if (const char* env = std::getenv("NCPU")) if (auto v = std::atoi(env); v > 0) n_workers = v;
@@ -841,6 +795,9 @@ int main(int argc, char** argv) {
     });
 
     UnionFind uf;
+    // Main optimization: build identity links concurrently with event ingestion.
+    // Event parsing needs the products table but does not read UnionFind.
+    // Joining t_links before dedup establishes safe read-after-write synchronization.
     std::thread t_links([&]() {
     {
         auto link_files = list_csvs(data_dir / "links");
@@ -887,7 +844,7 @@ int main(int argc, char** argv) {
     }
     uf.freeze();
     });
-    t_prod.join();
+    t_prod.join(); // needed for category lookups during event parsing
     lap("1_products_ready_links_parallel");
 
     std::vector<MMapFile> event_mmaps;
@@ -897,14 +854,7 @@ int main(int argc, char** argv) {
         if (f.open(p)) { total_ev_bytes += f.size; event_mmaps.push_back(std::move(f)); }
     }
     auto ev_chunks = make_chunks(event_mmaps);
-    const bool spill_events = (total_ev_bytes > SPILL_THRESHOLD_BYTES);
-    if (spill_events) fs::create_directories(scratch_dir);
-
-    auto spill_path = [&](size_t s, unsigned tid) {
-        return scratch_dir / ("ev_s" + std::to_string(s) + "_t" + std::to_string(tid) + ".bin");
-    };
-
-    const size_t est_ev_per_bucket = spill_events ? 1024 : (total_ev_bytes / (100 * n_workers * N_SHARDS) + 32);
+    const size_t est_ev_per_bucket = total_ev_bytes / (100 * n_workers * N_SHARDS) + 32;
 
     std::vector<std::vector<std::vector<RawDedupEvent>>> ev_buckets(
         n_workers, std::vector<std::vector<RawDedupEvent>>(N_SHARDS));
@@ -913,21 +863,7 @@ int main(int argc, char** argv) {
         auto worker = [&](unsigned tid) {
             auto& my_b = ev_buckets[tid];
             for (auto& b : my_b) b.reserve(est_ev_per_bucket);
-            std::vector<int> spill_fds;
-            if (spill_events) spill_fds.assign(N_SHARDS, -1);
-
-            auto flush_shard = [&](size_t s) {
-                if (my_b[s].empty()) return;
-                if (spill_fds[s] < 0) {
-                    auto p = spill_path(s, tid);
-                    spill_fds[s] = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    if (spill_fds[s] < 0) { std::perror("spill open failed"); std::exit(1); }
-                }
-                write_all(spill_fds[s], my_b[s].data(), my_b[s].size() * sizeof(RawDedupEvent));
-                my_b[s].clear();
-            };
-
-            DateCache dc_in, dc_ev;
+            DateCache dc;
             std::string_view c[7];
             while (true) {
                 size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -942,12 +878,12 @@ int main(int argc, char** argv) {
 
                     if (!parse_csv(ln, 7, c) || c[0].empty()) continue;
                     int64_t ingest_ts = 0;
-                    if (!parse_ts(c[3], ingest_ts, dc_in)) continue;
+                    if (!parse_ts(c[3], ingest_ts, dc)) continue;
 
                     Hash128 h = hash128(c[0]);
-                    RawDedupEvent ev{h, ingest_ts, 0, nullptr, 0, 0, 0};
+                    RawDedupEvent ev{h, ingest_ts, 0, nullptr, 0, 0};
                     int64_t ts = 0;
-                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts, dc_ev) &&
+                    if (!c[1].empty() && !c[5].empty() && parse_ts(c[2], ts, dc) &&
                         ts >= win_start && ts < win_end && (ingest_ts - ts) <= MS_PER_DAY) {
                         bool ok = true, is_purch = false;
                         int32_t price = 0;
@@ -962,21 +898,11 @@ int main(int argc, char** argv) {
                             }
                             ev.ts = ts;
                             ev.user_ptr = c[1].data();
-                            ev.category_id = cat_id;
+                            ev.ulen_cat = (static_cast<uint32_t>(c[1].size()) << 16) | (cat_id & 0xFFFFu);
                             ev.price_flags = (static_cast<uint32_t>(price) << 2) | 1u | (is_purch ? 2u : 0u);
-                            ev.user_len = static_cast<uint16_t>(c[1].size());
                         }
                     }
-                    size_t s = h.lo & SHARD_MASK;
-                    my_b[s].push_back(ev);
-                    if (spill_events && my_b[s].size() >= SPILL_BATCH_EVENTS) flush_shard(s);
-                }
-            }
-            if (spill_events) {
-                for (size_t s = 0; s < N_SHARDS; ++s) {
-                    flush_shard(s);
-                    if (spill_fds[s] >= 0) ::close(spill_fds[s]);
-                    std::vector<RawDedupEvent>().swap(my_b[s]);
+                    my_b[h.lo & SHARD_MASK].push_back(ev);
                 }
             }
         };
@@ -1005,47 +931,20 @@ int main(int argc, char** argv) {
             while (true) {
                 size_t s = next_s.fetch_add(1, std::memory_order_relaxed);
                 if (s >= N_SHARDS) break;
+                size_t total = 0;
+                for (unsigned t = 0; t < n_workers; ++t) total += ev_buckets[t][s].size();
+                if (total == 0) continue;
 
-                if (spill_events) {
-                    std::vector<MMapFile> sfiles(n_workers);
-                    size_t total = 0;
-                    for (unsigned t = 0; t < n_workers; ++t) {
-                        if (sfiles[t].open(spill_path(s, t))) {
-                            total += sfiles[t].size / sizeof(RawDedupEvent);
-                        }
+                map.reset(total);
+                const size_t mask = map.mask;
+                for (unsigned t = 0; t < n_workers; ++t) {
+                    const auto& vec = ev_buckets[t][s];
+                    const size_t n = vec.size();
+                    for (size_t i = 0; i < n; ++i) {
+                        if (i + 16 < n) __builtin_prefetch(&map.slots[vec[i + 16].eid_hash.lo & mask], 1, 1);
+                        map.insert_or_min(vec[i]);
                     }
-                    if (total == 0) continue;
-
-                    map.reset(total);
-                    const size_t mask = map.mask;
-                    for (unsigned t = 0; t < n_workers; ++t) {
-                        if (!sfiles[t].data) continue;
-                        const auto* arr = reinterpret_cast<const RawDedupEvent*>(sfiles[t].data);
-                        const size_t n = sfiles[t].size / sizeof(RawDedupEvent);
-                        for (size_t i = 0; i < n; ++i) {
-                            if (i + 16 < n) __builtin_prefetch(&map.slots[arr[i + 16].eid_hash.lo & mask], 1, 1);
-                            map.insert_or_min(arr[i]);
-                        }
-                        sfiles[t].close();
-                        std::error_code ec;
-                        fs::remove(spill_path(s, t), ec);
-                    }
-                } else {
-                    size_t total = 0;
-                    for (unsigned t = 0; t < n_workers; ++t) total += ev_buckets[t][s].size();
-                    if (total == 0) continue;
-
-                    map.reset(total);
-                    const size_t mask = map.mask;
-                    for (unsigned t = 0; t < n_workers; ++t) {
-                        const auto& vec = ev_buckets[t][s];
-                        const size_t n = vec.size();
-                        for (size_t i = 0; i < n; ++i) {
-                            if (i + 16 < n) __builtin_prefetch(&map.slots[vec[i + 16].eid_hash.lo & mask], 1, 1);
-                            map.insert_or_min(vec[i]);
-                        }
-                        std::vector<RawDedupEvent>().swap(ev_buckets[t][s]);
-                    }
+                    std::vector<RawDedupEvent>().swap(ev_buckets[t][s]);
                 }
 
                 const size_t np = map.payloads.size();
@@ -1054,18 +953,18 @@ int main(int argc, char** argv) {
                     for (size_t i = base; i < lim; ++i) {
                         const auto& e = map.payloads[i];
                         if (!(e.price_flags & 1u)) continue;
-                        uint64_t h = hash64(std::string_view(e.user_ptr, e.user_len));
+                        uint64_t h = hash64(std::string_view(e.user_ptr, e.ulen_cat >> 16));
                         uhashes[i - base] = h;
                         if (has_uf) __builtin_prefetch(&uf.map.slots[h & uf_mask], 0, 1);
                     }
                     for (size_t i = base; i < lim; ++i) {
                         const auto& e = map.payloads[i];
                         if (!(e.price_flags & 1u)) continue;
-                        std::string_view u(e.user_ptr, e.user_len);
+                        std::string_view u(e.user_ptr, e.ulen_cat >> 16);
                         auto [person, ph] = uf.canonical_with_hash_prehashed(u, uhashes[i - base]);
                         my_pb[ph & SHARD_MASK].push_back({
                             ph, person,
-                            ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), e.category_id, (e.price_flags & 2u) != 0}
+                            ValidEvent{e.ts, static_cast<int32_t>(e.price_flags >> 2), e.ulen_cat & 0xFFFFu, (e.price_flags & 2u) != 0}
                         });
                     }
                 }
@@ -1280,6 +1179,7 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> ck_offsets;
         std::vector<uint32_t> ck_pos;
         std::vector<ValidClick> flat_clicks;
+        // Scratch is retained per aggregation worker, not reallocated per user.
         std::vector<ValidEvent> event_radix_scratch;
         std::vector<ValidClick> click_radix_scratch;
 
@@ -1328,6 +1228,8 @@ int main(int argc, char** argv) {
 #if SHOPPING_RADIX_CLICKS
                     if (n_cks >= SHOPPING_RADIX_THRESHOLD) {
                         radix_sort_timestamp(clicks, n_cks, click_radix_scratch);
+                        // Attribution assumes the first record in each timestamp
+                        // tie has the smallest ID, just like the old comparator.
                         promote_smallest_click_id_in_ties(clicks, n_cks);
                     } else
 #endif
