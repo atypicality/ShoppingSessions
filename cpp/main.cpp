@@ -793,6 +793,7 @@ void write_parquet_table(const fs::path& path, const std::shared_ptr<arrow::Tabl
     auto props = parquet::WriterProperties::Builder()
                      .compression(arrow::Compression::UNCOMPRESSED)
                      ->disable_dictionary("user_id")
+                     ->disable_statistics()
                      ->build();
     auto st = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out_res, 1 << 20, props);
     if (!st.ok()) { std::cerr << st.ToString() << "\n"; std::exit(1); }
