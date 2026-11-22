@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY cpp/main.cpp .
 ARG TARGETARCH
-ARG CPU_TARGET=cascadelake
+ARG CPU_TARGET=native
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
         g++ -O3 -DNDEBUG -march=$CPU_TARGET -maes -flto -fuse-linker-plugin -s -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow; \
     else \

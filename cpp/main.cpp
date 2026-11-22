@@ -1023,7 +1023,6 @@ int main(int argc, char** argv) {
                     const auto& vec = ev_buckets[t][s];
                     const size_t n = vec.size();
                     for (size_t i = 0; i < n; ++i) {
-                        if (i + 16 < n) __builtin_prefetch(&map.slots[vec[i + 16].eid_hash.lo & mask], 1, 1);
                         map.insert_or_min(vec[i]);
                     }
                 }
