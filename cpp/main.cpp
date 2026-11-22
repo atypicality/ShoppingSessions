@@ -361,6 +361,96 @@ inline bool parse_csv(std::string_view line, size_t n, std::string_view* out) no
     return true;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512bw")))
+inline bool next_csv_line_avx512(const char*& cur, const char* end, size_t n,
+                                 std::string_view* out) noexcept {
+    const char* line_start = cur;
+    const char* field_start = cur;
+    size_t field = 0;
+    bool quoted = false;
+    const __m512i comma = _mm512_set1_epi8(',');
+    const __m512i quote = _mm512_set1_epi8('"');
+    const __m512i newline = _mm512_set1_epi8('\n');
+
+    while (cur + 64 <= end) {
+        const char* block = cur;
+        const __m512i bytes = _mm512_loadu_si512(reinterpret_cast<const void*>(block));
+        uint64_t nl = _mm512_cmpeq_epi8_mask(bytes, newline);
+        uint64_t q = _mm512_cmpeq_epi8_mask(bytes, quote);
+        uint64_t commas = _mm512_cmpeq_epi8_mask(bytes, comma);
+
+        if (nl) {
+            const unsigned stop = static_cast<unsigned>(__builtin_ctzll(nl));
+            const uint64_t before = stop == 0 ? 0 : ((UINT64_C(1) << stop) - 1);
+            const char* line_end = block + stop;
+            cur = line_end + 1;
+            if (quoted || (q & before))
+                return parse_csv_slow(std::string_view(line_start, line_end - line_start), n, out);
+            commas &= before;
+            while (commas) {
+                const size_t off = static_cast<size_t>(__builtin_ctzll(commas));
+                const char* comma_pos = block + off;
+                if (field >= n) return false;
+                out[field++] = std::string_view(field_start, comma_pos - field_start);
+                field_start = comma_pos + 1;
+                commas &= commas - 1;
+            }
+            if (line_end == line_start || field + 1 != n) return false;
+            out[field] = std::string_view(field_start, line_end - field_start);
+            return true;
+        }
+
+        if (q) quoted = true;
+        if (!quoted) {
+            while (commas) {
+                const size_t off = static_cast<size_t>(__builtin_ctzll(commas));
+                const char* comma_pos = block + off;
+                if (field >= n) return false;
+                out[field++] = std::string_view(field_start, comma_pos - field_start);
+                field_start = comma_pos + 1;
+                commas &= commas - 1;
+            }
+        }
+        cur += 64;
+    }
+
+    for (; cur < end; ++cur) {
+        const char ch = *cur;
+        if (ch == '\n') {
+            const char* line_end = cur++;
+            if (quoted) return parse_csv_slow(std::string_view(line_start, line_end - line_start), n, out);
+            if (line_end == line_start || field + 1 != n) return false;
+            out[field] = std::string_view(field_start, line_end - field_start);
+            return true;
+        }
+        if (ch == '"') quoted = true;
+        else if (!quoted && ch == ',') {
+            if (field >= n) return false;
+            out[field++] = std::string_view(field_start, cur - field_start);
+            field_start = cur + 1;
+        }
+    }
+    if (quoted || end == line_start || field + 1 != n) return false;
+    out[field] = std::string_view(field_start, end - field_start);
+    return true;
+}
+#endif
+
+inline bool next_csv_line(const char*& cur, const char* end, size_t n,
+                          std::string_view* out) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    static const bool has_avx512 = __builtin_cpu_supports("avx512bw");
+    if (has_avx512) return next_csv_line_avx512(cur, end, n, out);
+#endif
+    const char* line_start = cur;
+    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
+    const char* line_end = nl ? nl : end;
+    const size_t len = static_cast<size_t>(line_end - line_start);
+    cur = nl ? nl + 1 : end;
+    return parse_csv(std::string_view(line_start, len), n, out);
+}
+
 inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) noexcept {
     y -= m <= 2;
     int64_t era = (y >= 0 ? y : y - 399) / 400;
@@ -946,12 +1036,7 @@ int main(int argc, char** argv) {
                 const char* cur = ev_chunks[idx].begin;
                 const char* end = ev_chunks[idx].end;
                 while (cur < end) {
-                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
-                    size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
-                    std::string_view ln(cur, len);
-                    cur = nl ? nl + 1 : end;
-
-                    if (!parse_csv(ln, 7, c) || c[0].empty()) continue;
+                    if (!next_csv_line(cur, end, 7, c) || c[0].empty()) continue;
                     int64_t ingest_ts = 0;
                     if (!parse_ts(c[3], ingest_ts, dc_in)) continue;
 
@@ -1177,12 +1262,7 @@ int main(int argc, char** argv) {
                 const char* cur = ck_chunks[idx].begin;
                 const char* end = ck_chunks[idx].end;
                 while (cur < end) {
-                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', static_cast<size_t>(end - cur)));
-                    size_t len = nl ? static_cast<size_t>(nl - cur) : static_cast<size_t>(end - cur);
-                    std::string_view ln(cur, len);
-                    cur = nl ? nl + 1 : end;
-
-                    if (!parse_csv(ln, 4, c) || c[0].empty() || c[1].empty()) continue;
+                    if (!next_csv_line(cur, end, 4, c) || c[0].empty() || c[1].empty()) continue;
                     uint32_t camp_id = camp_ids.find(c[2]);
                     if (camp_id == UINT32_MAX) continue;
                     int64_t ts = 0;
