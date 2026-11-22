@@ -8,7 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY cpp/main.cpp .
-RUN g++ -O3 -DNDEBUG -march=x86-64-v3 -flto -fuse-linker-plugin -s -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow
+ARG TARGETARCH
+ARG CPU_TARGET=cascadelake
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        g++ -O3 -DNDEBUG -march=$CPU_TARGET -maes -flto -fuse-linker-plugin -s -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow; \
+    else \
+        g++ -O3 -DNDEBUG -march=native -flto -fuse-linker-plugin -s -std=c++20 -pthread main.cpp -o pipeline -lparquet -larrow; \
+    fi
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg libmimalloc2.0 \
@@ -25,5 +31,6 @@ COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh /app/pipeline
 
 USER 1000
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.2
+ENV LD_PRELOAD=libmimalloc.so.2
+ENV MIMALLOC_PURGE_DELAY=-1
 CMD ["/app/run.sh"]
